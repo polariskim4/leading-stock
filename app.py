@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
+import requests
 
 # 페이지 설정
 st.set_page_config(page_title="실시간 주도 섹터 및 눌림목 분석", layout="wide")
@@ -20,13 +21,16 @@ st.caption(f"기준 기간: {last_year_end} ~ {today_str} (YTD 분석)")
 @st.cache_data(ttl=3600)
 def get_stock_universe():
     try:
+        # 위키피디아 차단을 피하기 위한 헤더 설정
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        
         # S&P 500 & Sectors
-        sp500 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
+        sp500 = pd.read_html(requests.get('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', headers=headers).text)[0]
         sp500_df = sp500[['Symbol', 'GICS Sector']].rename(columns={'Symbol': 'Ticker', 'GICS Sector': 'Sector'})
         
         # Nasdaq 100 & Dow 30 (섹터 정보는 S&P500과 병합하여 활용)
-        ndx_tickers = pd.read_html('https://en.wikipedia.org/wiki/Nasdaq-100')[4]['Ticker'].tolist()
-        dow_tickers = pd.read_html('https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average')[1]['Symbol'].tolist()
+        ndx_tickers = pd.read_html(requests.get('https://en.wikipedia.org/wiki/Nasdaq-100', headers=headers).text)[4]['Ticker'].tolist()
+        dow_tickers = pd.read_html(requests.get('https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average', headers=headers).text)[1]['Symbol'].tolist()
         
         all_tickers = list(set(sp500_df['Ticker'].tolist() + ndx_tickers + dow_tickers))
         all_tickers = [t.replace('.', '-') for t in all_tickers]
