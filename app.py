@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 페이지 설정
 st.set_page_config(page_title="Market Alpha Hunter", layout="wide")
 
-# UI 스타일 개선 (우측 정렬 및 컴팩트 레이아웃)
+# UI 스타일 개선
 st.markdown("""
     <style>
     .main { font-size: 0.85rem; }
@@ -21,21 +21,21 @@ st.markdown("""
 
 st.title("📈 정확한 성과 및 눌림목 분석 (S&P500, Nasdaq100, Dow30)")
 
-# --- 1. 날짜 설정 (정확한 YTD 기준) ---
+# --- 1. 날짜 설정 ---
 today = datetime.now()
 last_year_start = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
 last_year_end = datetime(today.year - 1, 12, 31).strftime('%Y-%m-%d')
 today_str = today.strftime('%Y-%m-%d')
 
-# --- 2. 데이터 소스 가져오기 함수들 ---
+# --- 2. 데이터 소스 가져오기 (안정성 강화) ---
 @st.cache_data(ttl=86400)
 def get_sp500_list():
     headers = {'User-Agent': 'Mozilla/5.0'}
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        tables = pd.read_html(io.StringIO(res.text))
-        df = tables[0]
+        # 'Symbol' 텍스트를 포함한 테이블 매칭
+        df = pd.read_html(io.StringIO(res.text), match='Symbol')[0]
         df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False).str.strip()
         df = df[~df['Symbol'].str.isnumeric()]
         return df[['Symbol', 'GICS Sector']]
@@ -47,10 +47,11 @@ def get_nasdaq100_list():
     url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        df = pd.read_html(io.StringIO(res.text))[4] # 일반적으로 4번째 테이블
+        # 인덱스 [4] 대신 'Ticker' 텍스트가 있는 테이블을 직접 찾습니다.
+        df = pd.read_html(io.StringIO(res.text), match='Ticker')[0]
         ticker_col = 'Ticker' if 'Ticker' in df.columns else df.columns[1]
-        tickers = df[ticker_col].str.replace('.', '-', regex=False).str.strip().tolist()
-        return [t for t in tickers if not t.isdigit()]
+        tickers = df[ticker_col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
+        return [t for t in tickers if t and not t.isdigit() and t != 'nan']
     except: return []
 
 @st.cache_data(ttl=86400)
@@ -59,18 +60,17 @@ def get_dow30_list():
     url = 'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average'
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        df = pd.read_html(io.StringIO(res.text))[1] # 두 번째 테이블
+        # 'Symbol' 텍스트가 있는 테이블 매칭
+        df = pd.read_html(io.StringIO(res.text), match='Symbol')[0]
         ticker_col = 'Symbol' if 'Symbol' in df.columns else df.columns[1]
-        tickers = df[ticker_col].str.replace('.', '-', regex=False).str.strip().tolist()
-        return [t for t in tickers if not t.isdigit()]
+        tickers = df[ticker_col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
+        return [t for t in tickers if t and not t.isdigit() and t != 'nan']
     except: return []
 
 # 데이터 로드
 sp500_data = get_sp500_list()
 
 if not sp500_data.empty:
-    # --- UI 사이드바 설정 ---
-    # 기존 섹터 리스트에 Nasdaq100과 Dow30을 추가
     gics_sectors = sorted(sp500_data['GICS Sector'].unique().tolist())
     menu_options = gics_sectors + ["Nasdaq100", "Dow30"]
     
@@ -80,7 +80,6 @@ if not sp500_data.empty:
         key="market_selector_unique"
     )
     
-    # 선택된 메뉴에 따라 티커 리스트 결정
     if selected_menu == "Nasdaq100":
         target_tickers = get_nasdaq100_list()
     elif selected_menu == "Dow30":
@@ -91,7 +90,7 @@ if not sp500_data.empty:
     st.sidebar.write(f"조회 대상 종목: {len(target_tickers)}개")
     run_analysis = st.sidebar.button(f"{selected_menu} 분석 시작", key="run_button_unique")
 
-    if run_analysis:
+    if run_analysis and len(target_tickers) > 0:
         analysis_results = []
         hist_start = (datetime.now() - timedelta(weeks=160)).strftime('%Y-%m-%d')
         session = requests.Session()
@@ -127,7 +126,6 @@ if not sp500_data.empty:
                             ma50 = close.rolling(50).mean().iloc[-1]
                             ma100 = close.rolling(100).mean().iloc[-1]
 
-                            # SMA 50 > 100 정배열 유지 종목만 필터
                             if not (ma50 > ma100): continue
 
                             dist_ma20 = abs(curr_p - ma20) / ma20 * 100
@@ -148,23 +146,15 @@ if not sp500_data.empty:
 
         if analysis_results:
             final_df = pd.DataFrame(analysis_results)
-            
             st.subheader(f"🏆 {selected_menu} 올해 성과 상위 TOP 3")
             top_3 = final_df.sort_values('YTD', ascending=False).head(3)
-            st.dataframe(
-                top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1).set_properties(**{'text-align': 'right'}),
-                hide_index=True, width="stretch"
-            )
+            st.dataframe(top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1).set_properties(**{'text-align': 'right'}), hide_index=True, width="stretch")
 
             st.divider()
             st.subheader(f"🔍 {selected_menu} 눌림목 추천 TOP 5")
             recs = final_df.sort_values('인접도').head(5)
-            st.dataframe(
-                recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '2Y_고점대비', '3Y_고점대비', '인접SMA']].style
-                .format(precision=1).set_properties(**{'text-align': 'right'}),
-                hide_index=True, width="stretch"
-            )
+            st.dataframe(recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '2Y_고점대비', '3Y_고점대비', '인접SMA']].style.format(precision=1).set_properties(**{'text-align': 'right'}), hide_index=True, width="stretch")
         else:
             st.warning("조건을 만족하는 종목을 찾지 못했습니다.")
-else:
-    st.warning("분석 대상을 불러오지 못했습니다.")
+    elif run_analysis and len(target_tickers) == 0:
+        st.error(f"{selected_menu} 종목 리스트를 가져오는 데 실패했습니다.")
