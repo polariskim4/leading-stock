@@ -90,12 +90,14 @@ if not sp500_data.empty:
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
         with st.status(f"{selected_menu} 데이터 분석 중...", expanded=True) as status:
-            chunk_size = 10
+            chunk_size = 15
             for i in range(0, len(target_tickers), chunk_size):
                 chunk = target_tickers[i:i + chunk_size]
                 try:
+                    # YTD용 일봉 데이터
                     ytd_base_df = yf.download(chunk, start=last_year_start, end=last_year_end, 
                                              interval="1d", group_by='ticker', session=session, threads=False, progress=False)
+                    # 추세/거래량용 주봉 데이터
                     w_data = yf.download(chunk, start=hist_start, end=today_str, 
                                         interval="1wk", group_by='ticker', session=session, threads=False, progress=False)
                     
@@ -116,24 +118,25 @@ if not sp500_data.empty:
                             curr_p = close.iloc[-1]
                             curr_v = volume.iloc[-1]
                             
-                            # --- 거래량 조건 계산 ---
-                            # 최근 8주(약 2달)간의 최대 주간 거래량 (상승 시 거래량 추정치)
-                            max_rally_vol = volume.iloc[-8:-1].max()
-                            vol_ratio = (curr_v / max_rally_vol) if max_rally_vol > 0 else 1.0
+                            # --- 거래량 조건 완화 ---
+                            # 최근 8주간의 최대 거래량 대비 현재 거래량 비중
+                            max_v_8w = volume.iloc[-8:-1].max()
+                            vol_ratio = (curr_v / max_v_8w) if max_v_8w > 0 else 1.0
 
-                            # YTD 및 이평선
+                            # 수익률 및 이평선
                             ytd_ret = ((curr_p / base_price) - 1) * 100
                             ma20 = close.rolling(20).mean().iloc[-1]
                             ma50 = close.rolling(50).mean().iloc[-1]
                             ma100 = close.rolling(100).mean().iloc[-1]
 
-                            # 필터 1: SMA 50 > 100 (추세)
+                            # 필터 1: SMA 50 > 100 (장기 우상향)
                             if not (ma50 > ma100): continue
                             
-                            # 필터 2: 거래량 마름 (직전 최고 거래량 대비 30% 이하)
-                            if vol_ratio > 0.35: # 사용자 요청 20~30%이나, 주봉 특성상 35%까지 완화 적용
+                            # 필터 2: 거래량 마름 (임계값을 60%로 상향 조정)
+                            if vol_ratio > 0.60: 
                                 continue
 
+                            # 이평선 근접도
                             dist_ma20 = abs(curr_p - ma20) / ma20 * 100
                             dist_ma50 = abs(curr_p - ma50) / ma50 * 100
                             
@@ -141,31 +144,37 @@ if not sp500_data.empty:
                                 'Ticker': ticker, 'YTD': ytd_ret, '현재가': curr_p,
                                 '1Y_고점대비': ((curr_p / close.tail(52).max()) - 1) * 100,
                                 '2Y_고점대비': ((curr_p / close.tail(104).max()) - 1) * 100,
-                                '거래량비중': vol_ratio * 100, # 현재 거래량이 고점 대비 몇 %인가
+                                '거래량비중(%)': vol_ratio * 100, 
                                 '인접도': min(dist_ma20, dist_ma50),
                                 '인접SMA': 'SMA 20' if dist_ma20 < dist_ma50 else 'SMA 50'
                             })
                         except: continue
                 except: pass
                 time.sleep(random.uniform(0.5, 0.8))
+                progress_bar.progress(min((i + chunk_size) / len(target_tickers), 1.0))
             status.update(label="분석 완료!", state="complete")
 
         if analysis_results:
             final_df = pd.DataFrame(analysis_results)
             
-            st.subheader(f"🏆 {selected_menu} 올해 성과 상위 TOP 3")
+            # --- 1. 성과 상위 TOP 3 ---
+            st.subheader(f"🏆 {selected_menu} 올해 성과 상위 TOP 3 (YTD)")
             top_3 = final_df.sort_values('YTD', ascending=False).head(3)
-            st.dataframe(top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1), hide_index=True, width="stretch")
+            st.dataframe(
+                top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1).set_properties(**{'text-align': 'right'}),
+                hide_index=True, width="stretch"
+            )
 
+            # --- 2. 눌림목 추천 TOP 5 ---
             st.divider()
             st.subheader(f"🔍 거래량 급감 기반 눌림목 추천 TOP 5")
-            st.caption("조건: SMA 50 > 100 & 현재 거래량이 최근 8주 최대 거래량의 35% 이하")
+            st.caption("조건: SMA 50 > 100 & 현재 거래량이 최근 8주 최대 거래량의 60% 이하 (인접도순)")
             
             recs = final_df.sort_values('인접도').head(5)
             st.dataframe(
-                recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '거래량비중', '인접SMA']].style
+                recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '거래량비중(%)', '인접SMA']].style
                 .format(precision=1).set_properties(**{'text-align': 'right'}),
                 hide_index=True, width="stretch"
             )
         else:
-            st.warning("거래량이 충분히 마른(급감한) 눌림목 종목을 찾지 못했습니다.")
+            st.warning("조건에 부합하는 종목을 찾지 못했습니다. 분석 범위를 넓히거나 거래량이 더 줄어들 때까지 기다려야 할 수 있습니다.")
