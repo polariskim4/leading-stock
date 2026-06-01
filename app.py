@@ -90,14 +90,18 @@ if not sp500_data.empty:
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
         with st.status(f"{selected_menu} 데이터 분석 중...", expanded=True) as status:
+            # --- NameError 수정: progress_bar와 status_text 초기화 ---
+            progress_bar = st.progress(0) 
+            status_text = st.empty()
+            # --- 수정 끝 ---
+
             chunk_size = 15
             for i in range(0, len(target_tickers), chunk_size):
                 chunk = target_tickers[i:i + chunk_size]
+                status_text.text(f"데이터 수집 중: {i}/{len(target_tickers)} 종목 완료...") # 진행 상황 업데이트
                 try:
-                    # YTD용 일봉 데이터
                     ytd_base_df = yf.download(chunk, start=last_year_start, end=last_year_end, 
                                              interval="1d", group_by='ticker', session=session, threads=False, progress=False)
-                    # 추세/거래량용 주봉 데이터
                     w_data = yf.download(chunk, start=hist_start, end=today_str, 
                                         interval="1wk", group_by='ticker', session=session, threads=False, progress=False)
                     
@@ -118,8 +122,7 @@ if not sp500_data.empty:
                             curr_p = close.iloc[-1]
                             curr_v = volume.iloc[-1]
                             
-                            # --- 거래량 조건 완화 ---
-                            # 최근 8주간의 최대 거래량 대비 현재 거래량 비중
+                            # --- 거래량 조건 ---
                             max_v_8w = volume.iloc[-8:-1].max()
                             vol_ratio = (curr_v / max_v_8w) if max_v_8w > 0 else 1.0
 
@@ -132,7 +135,7 @@ if not sp500_data.empty:
                             # 필터 1: SMA 50 > 100 (장기 우상향)
                             if not (ma50 > ma100): continue
                             
-                            # 필터 2: 거래량 마름 (임계값을 60%로 상향 조정)
+                            # 필터 2: 거래량 마름 (임계값 60%로 완화)
                             if vol_ratio > 0.60: 
                                 continue
 
@@ -152,20 +155,18 @@ if not sp500_data.empty:
                 except: pass
                 time.sleep(random.uniform(0.5, 0.8))
                 progress_bar.progress(min((i + chunk_size) / len(target_tickers), 1.0))
+            
+            status_text.empty() # 진행 상황 텍스트 제거
+            progress_bar.empty() # 프로그레스 바 제거
             status.update(label="분석 완료!", state="complete")
 
         if analysis_results:
             final_df = pd.DataFrame(analysis_results)
             
-            # --- 1. 성과 상위 TOP 3 ---
             st.subheader(f"🏆 {selected_menu} 올해 성과 상위 TOP 3 (YTD)")
             top_3 = final_df.sort_values('YTD', ascending=False).head(3)
-            st.dataframe(
-                top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1).set_properties(**{'text-align': 'right'}),
-                hide_index=True, width="stretch"
-            )
+            st.dataframe(top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1), hide_index=True, width="stretch")
 
-            # --- 2. 눌림목 추천 TOP 5 ---
             st.divider()
             st.subheader(f"🔍 거래량 급감 기반 눌림목 추천 TOP 5")
             st.caption("조건: SMA 50 > 100 & 현재 거래량이 최근 8주 최대 거래량의 60% 이하 (인접도순)")
@@ -178,3 +179,7 @@ if not sp500_data.empty:
             )
         else:
             st.warning("조건에 부합하는 종목을 찾지 못했습니다. 분석 범위를 넓히거나 거래량이 더 줄어들 때까지 기다려야 할 수 있습니다.")
+    elif run_analysis and len(target_tickers) == 0: # 버튼을 눌렀는데 종목이 없는 경우
+        st.error(f"{selected_menu} 종목 리스트를 가져오는 데 실패했습니다.")
+else:
+    st.warning("분석 대상을 불러오지 못했습니다.")
