@@ -19,7 +19,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("📈 성과 분석 및 거래량 기반 눌림목 추천")
+st.title("📈 섹터 주도주 분석 및 거래량 기반 눌림목 추천")
 
 # --- 1. 날짜 설정 ---
 today = datetime.now()
@@ -64,13 +64,11 @@ def get_dow30_list():
         return [t for t in tickers if t and not t.isdigit() and t != 'nan']
     except: return []
 
-# 데이터 로드
 sp500_data = get_sp500_list()
 
 if not sp500_data.empty:
     gics_sectors = sorted(sp500_data['GICS Sector'].unique().tolist())
     menu_options = gics_sectors + ["Nasdaq100", "Dow30"]
-    
     selected_menu = st.sidebar.selectbox("분석 대상 선택", menu_options, key="market_selector")
     
     if selected_menu == "Nasdaq100":
@@ -84,102 +82,89 @@ if not sp500_data.empty:
     run_analysis = st.sidebar.button(f"{selected_menu} 분석 시작")
 
     if run_analysis:
-        analysis_results = []
+        performance_results = [] # 전체 성과 순위용
+        recommendation_results = [] # 눌림목 필터용
+        
         hist_start = (datetime.now() - timedelta(weeks=160)).strftime('%Y-%m-%d')
         session = requests.Session()
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
         with st.status(f"{selected_menu} 데이터 분석 중...", expanded=True) as status:
-            # --- NameError 수정: progress_bar와 status_text 초기화 ---
-            progress_bar = st.progress(0) 
+            progress_bar = st.progress(0)
             status_text = st.empty()
-            # --- 수정 끝 ---
-
             chunk_size = 15
+
             for i in range(0, len(target_tickers), chunk_size):
                 chunk = target_tickers[i:i + chunk_size]
-                status_text.text(f"데이터 수집 중: {i}/{len(target_tickers)} 종목 완료...") # 진행 상황 업데이트
+                status_text.text(f"처리 중: {i}/{len(target_tickers)} 종목 완료")
                 try:
-                    ytd_base_df = yf.download(chunk, start=last_year_start, end=last_year_end, 
-                                             interval="1d", group_by='ticker', session=session, threads=False, progress=False)
+                    ytd_base_df = yf.download(chunk, start=last_year_end_base if 'last_year_end_base' in locals() else last_year_start, 
+                                             end=last_year_end, interval="1d", group_by='ticker', session=session, threads=False, progress=False)
                     w_data = yf.download(chunk, start=hist_start, end=today_str, 
                                         interval="1wk", group_by='ticker', session=session, threads=False, progress=False)
                     
                     for ticker in chunk:
                         try:
-                            if ticker not in w_data.columns.levels[0]: continue
-                            if ticker in ytd_base_df.columns.levels[0]:
-                                t_base = ytd_base_df[ticker].dropna()
-                                if t_base.empty: continue
-                                base_price = t_base['Close'].iloc[-1]
-                            else: continue
-
-                            df = w_data[ticker].dropna()
-                            if len(df) < 100: continue 
-
-                            close = df['Close']
-                            volume = df['Volume']
-                            curr_p = close.iloc[-1]
-                            curr_v = volume.iloc[-1]
+                            if ticker not in w_data.columns.levels[0] or ticker not in ytd_base_df.columns.levels[0]: continue
                             
-                            # --- 거래량 조건 ---
-                            max_v_8w = volume.iloc[-8:-1].max()
+                            t_base = ytd_base_df[ticker].dropna()
+                            w_df = w_data[ticker].dropna()
+                            if t_base.empty or len(w_df) < 100: continue
+
+                            base_price = t_base['Close'].iloc[-1]
+                            curr_p = w_df['Close'].iloc[-1]
+                            curr_v = w_df['Volume'].iloc[-1]
+                            ytd_ret = ((curr_p / base_price) - 1) * 100
+
+                            # 1. 성과 순위 데이터 저장 (필터 없음)
+                            performance_results.append({
+                                'Ticker': ticker, '현재가': curr_p, 'YTD': ytd_ret
+                            })
+
+                            # 2. 기술적 지표 계산 (눌림목 필터용)
+                            ma20 = w_df['Close'].rolling(20).mean().iloc[-1]
+                            ma50 = w_df['Close'].rolling(50).mean().iloc[-1]
+                            ma100 = w_df['Close'].rolling(100).mean().iloc[-1]
+                            max_v_8w = w_df['Volume'].iloc[-8:-1].max()
                             vol_ratio = (curr_v / max_v_8w) if max_v_8w > 0 else 1.0
 
-                            # 수익률 및 이평선
-                            ytd_ret = ((curr_p / base_price) - 1) * 100
-                            ma20 = close.rolling(20).mean().iloc[-1]
-                            ma50 = close.rolling(50).mean().iloc[-1]
-                            ma100 = close.rolling(100).mean().iloc[-1]
-
-                            # 필터 1: SMA 50 > 100 (장기 우상향)
-                            if not (ma50 > ma100): continue
-                            
-                            # 필터 2: 거래량 마름 (임계값 60%로 완화)
-                            if vol_ratio > 0.60: 
-                                continue
-
-                            # 이평선 근접도
-                            dist_ma20 = abs(curr_p - ma20) / ma20 * 100
-                            dist_ma50 = abs(curr_p - ma50) / ma50 * 100
-                            
-                            analysis_results.append({
-                                'Ticker': ticker, 'YTD': ytd_ret, '현재가': curr_p,
-                                '1Y_고점대비': ((curr_p / close.tail(52).max()) - 1) * 100,
-                                '2Y_고점대비': ((curr_p / close.tail(104).max()) - 1) * 100,
-                                '거래량비중(%)': vol_ratio * 100, 
-                                '인접도': min(dist_ma20, dist_ma50),
-                                '인접SMA': 'SMA 20' if dist_ma20 < dist_ma50 else 'SMA 50'
-                            })
+                            # 눌림목 필터 적용
+                            if (ma50 > ma100) and (vol_ratio <= 0.65):
+                                dist_ma20 = abs(curr_p - ma20) / ma20 * 100
+                                dist_ma50 = abs(curr_p - ma50) / ma50 * 100
+                                recommendation_results.append({
+                                    'Ticker': ticker, 'YTD': ytd_ret, '현재가': curr_p,
+                                    '1Y_고점대비': ((curr_p / w_df['Close'].tail(52).max()) - 1) * 100,
+                                    '거래량비중(%)': vol_ratio * 100,
+                                    '인접도': min(dist_ma20, dist_ma50),
+                                    '인접SMA': 'SMA 20' if dist_ma20 < dist_ma50 else 'SMA 50'
+                                })
                         except: continue
                 except: pass
                 time.sleep(random.uniform(0.5, 0.8))
                 progress_bar.progress(min((i + chunk_size) / len(target_tickers), 1.0))
             
-            status_text.empty() # 진행 상황 텍스트 제거
-            progress_bar.empty() # 프로그레스 바 제거
+            status_text.empty()
+            progress_bar.empty()
             status.update(label="분석 완료!", state="complete")
 
-        if analysis_results:
-            final_df = pd.DataFrame(analysis_results)
-            
-            st.subheader(f"🏆 {selected_menu} 올해 성과 상위 TOP 3 (YTD)")
-            top_3 = final_df.sort_values('YTD', ascending=False).head(3)
-            st.dataframe(top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1), hide_index=True, width="stretch")
+        # --- 결과 출력 ---
+        if performance_results:
+            # 1. 섹터 전체 성과 상위 (YTD 기준)
+            st.subheader(f"🏆 {selected_menu} 성과 상위 TOP 3 (YTD)")
+            perf_df = pd.DataFrame(performance_results)
+            top_3 = perf_df.sort_values('YTD', ascending=False).head(3)
+            st.dataframe(top_3.style.format(precision=1), hide_index=True, width="stretch")
 
+            # 2. 눌림목 추천 종목
             st.divider()
-            st.subheader(f"🔍 거래량 급감 기반 눌림목 추천 TOP 5")
-            st.caption("조건: SMA 50 > 100 & 현재 거래량이 최근 8주 최대 거래량의 60% 이하 (인접도순)")
-            
-            recs = final_df.sort_values('인접도').head(5)
-            st.dataframe(
-                recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '거래량비중(%)', '인접SMA']].style
-                .format(precision=1).set_properties(**{'text-align': 'right'}),
-                hide_index=True, width="stretch"
-            )
+            st.subheader(f"🔍 {selected_menu} 기술적 눌림목 추천 TOP 5")
+            if recommendation_results:
+                recs_df = pd.DataFrame(recommendation_results)
+                recs = recs_df.sort_values('인접도').head(5)
+                st.dataframe(recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '거래량비중(%)', '인접SMA']].style.format(precision=1), 
+                             hide_index=True, width="stretch")
+            else:
+                st.info("현재 눌림목 조건(정배열 & 거래량 급감)을 만족하는 종목이 없습니다.")
         else:
-            st.warning("조건에 부합하는 종목을 찾지 못했습니다. 분석 범위를 넓히거나 거래량이 더 줄어들 때까지 기다려야 할 수 있습니다.")
-    elif run_analysis and len(target_tickers) == 0: # 버튼을 눌렀는데 종목이 없는 경우
-        st.error(f"{selected_menu} 종목 리스트를 가져오는 데 실패했습니다.")
-else:
-    st.warning("분석 대상을 불러오지 못했습니다.")
+            st.error("데이터를 불러오는 데 실패했습니다.")
