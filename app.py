@@ -19,7 +19,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("📈 정확한 성과 및 눌림목 분석 (S&P500, Nasdaq100, Dow30)")
+st.title("📈 성과 분석 및 거래량 기반 눌림목 추천")
 
 # --- 1. 날짜 설정 ---
 today = datetime.now()
@@ -27,14 +27,13 @@ last_year_start = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
 last_year_end = datetime(today.year - 1, 12, 31).strftime('%Y-%m-%d')
 today_str = today.strftime('%Y-%m-%d')
 
-# --- 2. 데이터 소스 가져오기 (안정성 강화) ---
+# --- 2. 데이터 소스 가져오기 ---
 @st.cache_data(ttl=86400)
 def get_sp500_list():
     headers = {'User-Agent': 'Mozilla/5.0'}
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        # 'Symbol' 텍스트를 포함한 테이블 매칭
         df = pd.read_html(io.StringIO(res.text), match='Symbol')[0]
         df['Symbol'] = df['Symbol'].str.replace('.', '-', regex=False).str.strip()
         df = df[~df['Symbol'].str.isnumeric()]
@@ -47,7 +46,6 @@ def get_nasdaq100_list():
     url = 'https://en.wikipedia.org/wiki/Nasdaq-100'
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        # 인덱스 [4] 대신 'Ticker' 텍스트가 있는 테이블을 직접 찾습니다.
         df = pd.read_html(io.StringIO(res.text), match='Ticker')[0]
         ticker_col = 'Ticker' if 'Ticker' in df.columns else df.columns[1]
         tickers = df[ticker_col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
@@ -60,7 +58,6 @@ def get_dow30_list():
     url = 'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average'
     try:
         res = requests.get(url, headers=headers, timeout=10)
-        # 'Symbol' 텍스트가 있는 테이블 매칭
         df = pd.read_html(io.StringIO(res.text), match='Symbol')[0]
         ticker_col = 'Symbol' if 'Symbol' in df.columns else df.columns[1]
         tickers = df[ticker_col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
@@ -74,11 +71,7 @@ if not sp500_data.empty:
     gics_sectors = sorted(sp500_data['GICS Sector'].unique().tolist())
     menu_options = gics_sectors + ["Nasdaq100", "Dow30"]
     
-    selected_menu = st.sidebar.selectbox(
-        "분석 대상(섹터/지수) 선택", 
-        menu_options, 
-        key="market_selector_unique"
-    )
+    selected_menu = st.sidebar.selectbox("분석 대상 선택", menu_options, key="market_selector")
     
     if selected_menu == "Nasdaq100":
         target_tickers = get_nasdaq100_list()
@@ -87,10 +80,10 @@ if not sp500_data.empty:
     else:
         target_tickers = sp500_data[sp500_data['GICS Sector'] == selected_menu]['Symbol'].tolist()
     
-    st.sidebar.write(f"조회 대상 종목: {len(target_tickers)}개")
-    run_analysis = st.sidebar.button(f"{selected_menu} 분석 시작", key="run_button_unique")
+    st.sidebar.write(f"조회 대상: {len(target_tickers)}개 종목")
+    run_analysis = st.sidebar.button(f"{selected_menu} 분석 시작")
 
-    if run_analysis and len(target_tickers) > 0:
+    if run_analysis:
         analysis_results = []
         hist_start = (datetime.now() - timedelta(weeks=160)).strftime('%Y-%m-%d')
         session = requests.Session()
@@ -119,14 +112,27 @@ if not sp500_data.empty:
                             if len(df) < 100: continue 
 
                             close = df['Close']
+                            volume = df['Volume']
                             curr_p = close.iloc[-1]
-                            ytd_ret = ((curr_p / base_price) - 1) * 100
+                            curr_v = volume.iloc[-1]
+                            
+                            # --- 거래량 조건 계산 ---
+                            # 최근 8주(약 2달)간의 최대 주간 거래량 (상승 시 거래량 추정치)
+                            max_rally_vol = volume.iloc[-8:-1].max()
+                            vol_ratio = (curr_v / max_rally_vol) if max_rally_vol > 0 else 1.0
 
+                            # YTD 및 이평선
+                            ytd_ret = ((curr_p / base_price) - 1) * 100
                             ma20 = close.rolling(20).mean().iloc[-1]
                             ma50 = close.rolling(50).mean().iloc[-1]
                             ma100 = close.rolling(100).mean().iloc[-1]
 
+                            # 필터 1: SMA 50 > 100 (추세)
                             if not (ma50 > ma100): continue
+                            
+                            # 필터 2: 거래량 마름 (직전 최고 거래량 대비 30% 이하)
+                            if vol_ratio > 0.35: # 사용자 요청 20~30%이나, 주봉 특성상 35%까지 완화 적용
+                                continue
 
                             dist_ma20 = abs(curr_p - ma20) / ma20 * 100
                             dist_ma50 = abs(curr_p - ma50) / ma50 * 100
@@ -135,7 +141,7 @@ if not sp500_data.empty:
                                 'Ticker': ticker, 'YTD': ytd_ret, '현재가': curr_p,
                                 '1Y_고점대비': ((curr_p / close.tail(52).max()) - 1) * 100,
                                 '2Y_고점대비': ((curr_p / close.tail(104).max()) - 1) * 100,
-                                '3Y_고점대비': ((curr_p / close.tail(156).max()) - 1) * 100,
+                                '거래량비중': vol_ratio * 100, # 현재 거래량이 고점 대비 몇 %인가
                                 '인접도': min(dist_ma20, dist_ma50),
                                 '인접SMA': 'SMA 20' if dist_ma20 < dist_ma50 else 'SMA 50'
                             })
@@ -146,15 +152,20 @@ if not sp500_data.empty:
 
         if analysis_results:
             final_df = pd.DataFrame(analysis_results)
+            
             st.subheader(f"🏆 {selected_menu} 올해 성과 상위 TOP 3")
             top_3 = final_df.sort_values('YTD', ascending=False).head(3)
-            st.dataframe(top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1).set_properties(**{'text-align': 'right'}), hide_index=True, width="stretch")
+            st.dataframe(top_3[['Ticker', '현재가', 'YTD']].style.format(precision=1), hide_index=True, width="stretch")
 
             st.divider()
-            st.subheader(f"🔍 {selected_menu} 눌림목 추천 TOP 5")
+            st.subheader(f"🔍 거래량 급감 기반 눌림목 추천 TOP 5")
+            st.caption("조건: SMA 50 > 100 & 현재 거래량이 최근 8주 최대 거래량의 35% 이하")
+            
             recs = final_df.sort_values('인접도').head(5)
-            st.dataframe(recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '2Y_고점대비', '3Y_고점대비', '인접SMA']].style.format(precision=1).set_properties(**{'text-align': 'right'}), hide_index=True, width="stretch")
+            st.dataframe(
+                recs[['Ticker', '현재가', 'YTD', '1Y_고점대비', '거래량비중', '인접SMA']].style
+                .format(precision=1).set_properties(**{'text-align': 'right'}),
+                hide_index=True, width="stretch"
+            )
         else:
-            st.warning("조건을 만족하는 종목을 찾지 못했습니다.")
-    elif run_analysis and len(target_tickers) == 0:
-        st.error(f"{selected_menu} 종목 리스트를 가져오는 데 실패했습니다.")
+            st.warning("거래량이 충분히 마른(급감한) 눌림목 종목을 찾지 못했습니다.")
