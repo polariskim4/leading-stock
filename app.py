@@ -23,7 +23,7 @@ st.title("📈 섹터 주도주 분석 및 거래량 기반 눌림목 추천")
 
 # 2. 유틸리티 함수: 포맷팅 및 단위 변환
 def format_val(val, is_currency=False):
-    if val is None or pd.isna(val) or val == "" or val == "nan":
+    if val is None or pd.isna(val) or val == "" or val == "nan" or val == 0:
         return "-"
     try:
         num = float(val)
@@ -39,17 +39,17 @@ def format_val(val, is_currency=False):
     except (ValueError, TypeError):
         return str(val)
 
-# 3. 날짜 설정 (연도 전환 대응)
+# 3. 날짜 설정
 today = datetime.now()
 last_year_start_range = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
 last_year_end_range = datetime(today.year, 1, 2).strftime('%Y-%m-%d')
 today_str = today.strftime('%Y-%m-%d')
 hist_start = (today - timedelta(weeks=160)).strftime('%Y-%m-%d')
 
-# 4. 데이터 소스 가져오기 (캐싱 적용)
+# 4. 데이터 소스 가져오기
 @st.cache_data(ttl=86400)
 def get_sp500_list():
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     try:
         res = requests.get(url, headers=headers, timeout=10)
@@ -69,8 +69,8 @@ def get_nasdaq100_list():
         return df[ticker_col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
     except: return []
 
-# 5. 사이드바 구성
 sp500_data = get_sp500_list()
+
 if not sp500_data.empty:
     gics_sectors = sorted(sp500_data['GICS Sector'].unique().tolist())
     menu_options = gics_sectors + ["Nasdaq100"]
@@ -87,10 +87,12 @@ if not sp500_data.empty:
     if run_analysis:
         performance_results = []
         recommendation_results = []
+        
+        # Yahoo Finance 차단 방지를 위한 세션 설정
         session = requests.Session()
-        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
 
-        with st.status(f"{selected_menu} 데이터 처리 중...", expanded=True) as status:
+        with st.status(f"{selected_menu} 분석 중...", expanded=True) as status:
             progress_bar = st.progress(0)
             chunk_size = 15
 
@@ -115,14 +117,12 @@ if not sp500_data.empty:
                             ytd_ret = ((curr_p / base_p) - 1) * 100
                             performance_results.append({'Ticker': ticker, '현재가': curr_p, 'YTD': ytd_ret})
 
-                            # 기술적 지표 계산
                             ma20 = w_df['Close'].rolling(20).mean().iloc[-1]
                             ma50 = w_df['Close'].rolling(50).mean().iloc[-1]
                             ma100 = w_df['Close'].rolling(100).mean().iloc[-1]
                             max_v_8w = w_df['Volume'].iloc[-8:-1].max()
                             vol_ratio = (w_df['Volume'].iloc[-1] / max_v_8w) if max_v_8w > 0 else 1.0
 
-                            # 눌림목 조건: 정배열 & 거래량 감소
                             if (ma50 > ma100) and (vol_ratio <= 0.65):
                                 dist_ma20 = abs(curr_p - ma20) / ma20 * 100
                                 dist_ma50 = abs(curr_p - ma50) / ma50 * 100
@@ -140,25 +140,36 @@ if not sp500_data.empty:
                 except: pass
                 progress_bar.progress(min((i + chunk_size) / len(target_tickers), 1.0))
 
-            # --- 상위 10개 종목 펀더멘털 정밀 분석 ---
+            # --- 상위 10개 종목 재무 데이터 정밀 수집 ---
             final_recs_list = []
             if recommendation_results:
                 recs_df_raw = pd.DataFrame(recommendation_results).sort_values('종합점수', ascending=False).head(10)
                 for _, row in recs_df_raw.iterrows():
-                    t_obj = yf.Ticker(row['Ticker'])
-                    info = t_obj.info
+                    ticker = row['Ticker']
+                    t_obj = yf.Ticker(ticker, session=session)
+                    
+                    # 데이터 안정성 확보를 위해 여러 소스 시도
+                    info = t_obj.info if t_obj.info else {}
+                    fast = t_obj.fast_info
+                    income_stmt = t_obj.income_stmt
+                    
+                    # Sales, Income은 재무제표에서 직접 추출 (더 정확함)
+                    sales = income_stmt.loc['Total Revenue'].iloc[0] if not income_stmt.empty and 'Total Revenue' in income_stmt.index else info.get('totalRevenue')
+                    net_income = income_stmt.loc['Net Income'].iloc[0] if not income_stmt.empty and 'Net Income' in income_stmt.index else info.get('netIncomeToCommon')
+
+                    # 3년 평균 P/E 계산
                     try:
-                        income_stmt = t_obj.income_stmt
                         if not income_stmt.empty and 'Net Income' in income_stmt.index:
                             avg_ni = income_stmt.loc['Net Income'].head(3).mean()
-                            avg_pe_3y = info.get('marketCap', 0) / avg_ni if avg_ni > 0 else None
+                            m_cap = fast.get('market_cap', info.get('marketCap', 0))
+                            avg_pe_3y = m_cap / avg_ni if avg_ni > 0 else None
                         else: avg_pe_3y = None
                     except: avg_pe_3y = None
 
                     row.update({
-                        'Market Cap': format_val(info.get('marketCap'), True),
-                        'Sales': format_val(info.get('totalRevenue'), True),
-                        'Income': format_val(info.get('netIncomeToCommon'), True),
+                        'Market Cap': format_val(fast.get('market_cap', info.get('marketCap')), True),
+                        'Sales': format_val(sales, True),
+                        'Income': format_val(net_income, True),
                         'P/E': format_val(info.get('trailingPE')),
                         '3Y Avg P/E': format_val(avg_pe_3y),
                         'Forward P/E': format_val(info.get('forwardPE')),
@@ -178,7 +189,7 @@ if not sp500_data.empty:
             
             status.update(label="분석 완료!", state="complete")
 
-        # --- 결과 출력 (버튼 클릭 블록 내부) ---
+        # --- 결과 출력 ---
         if performance_results:
             st.subheader(f"🏆 {selected_menu} 성과 상위 TOP 3 (YTD)")
             perf_df = pd.DataFrame(performance_results).sort_values('YTD', ascending=False).head(3)
