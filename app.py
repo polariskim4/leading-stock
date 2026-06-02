@@ -2,40 +2,43 @@ import pandas as pd
 import yfinance as yf
 import requests
 
+# 403 Forbidden 에러를 방지하기 위한 세션 설정
+def get_safe_session():
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
+    })
+    return session
+
 def get_recommendations(tickers):
     results = []
+    session = get_safe_session()
     
-    # 1. 403 에러 방지를 위한 헤더 설정
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    print(f"데이터 분석을 시작합니다. 대상 종목: {len(tickers)}개")
     
-    print(f"데이터 분석 시작 (총 {len(tickers)} 종목)...")
-
     for ticker in tickers:
         try:
-            # yfinance의 download 기능을 사용하여 한 번에 데이터를 가져옵니다.
-            # 최근 60일치 데이터를 가져오며, 에러 발생 시 로그를 남깁니다.
-            df = yf.download(ticker, period="60d", interval="1d", progress=False, timeout=10)
+            # 기존 로직 유지: 데이터 로드
+            # session을 추가하여 403 에러를 방지합니다.
+            stock = yf.Ticker(ticker, session=session)
+            df = stock.history(period="60d")
             
             if df.empty or len(df) < 20:
-                # 데이터가 없거나 SMA_20을 계산하기에 데이터가 부족한 경우
                 continue
             
-            # SMA 20 계산
+            # SMA 20 계산 (기존 기준)
             df['SMA_20'] = df['Close'].rolling(window=20).mean()
             
-            # 최근 데이터 추출
-            current_price = float(df['Close'].iloc[-1])
-            current_vol = float(df['Volume'].iloc[-1])
-            avg_vol = float(df['Volume'].mean())
-            sma_20 = float(df['SMA_20'].iloc[-1])
+            current_price = df['Close'].iloc[-1]
+            current_vol = df['Volume'].iloc[-1]
+            avg_vol = df['Volume'].mean()
+            sma_20 = df['SMA_20'].iloc[-1]
             
-            if pd.isna(sma_20): continue # SMA 값이 NaN이면 스킵
+            if pd.isna(sma_20): continue
 
-            # 지표 산출
-            sma_ratio = current_price / sma_20
-            vol_ratio = current_vol / avg_vol
+            # 지표 산출 (점수화의 기반)
+            sma_ratio = current_price / sma_20  # SMA 대비 가격 위치
+            vol_ratio = current_vol / avg_vol    # 평균 거래량 대비 현재 거래량
             
             results.append({
                 'Ticker': ticker,
@@ -45,42 +48,35 @@ def get_recommendations(tickers):
                 'SMA_Ratio': sma_ratio,
                 'Vol_Ratio': vol_ratio
             })
-            print(f"✅ {ticker} 분석 완료")
-            
         except Exception as e:
-            print(f"❌ {ticker} 분석 중 오류 발생: {e}")
+            print(f"{ticker} 분석 중 건너뜀: {e}")
             
-    if not results:
-        print("분석 결과가 없습니다. 티커 심볼이나 네트워크 상태를 확인해주세요.")
-        return pd.DataFrame()
-    
     res_df = pd.DataFrame(results)
     
-    # 점수 정규화 (Min-Max Scaling)
-    def normalize(series):
-        if series.max() == series.min():
-            return 100.0
-        return (series - series.min()) / (series.max() - series.min()) * 100
+    if not res_df.empty:
+        # 가중치 계산을 위한 정규화 (0~100점 스케일링)
+        def scale_score(series):
+            if series.max() == series.min(): return 100
+            return (series - series.min()) / (series.max() - series.min()) * 100
 
-    # SMA 70%, 거래량 30% 가중치 적용
-    res_df['SMA_Score'] = normalize(res_df['SMA_Ratio'])
-    res_df['Vol_Score'] = normalize(res_df['Vol_Ratio'])
-    res_df['Total_Score'] = (res_df['SMA_Score'] * 0.7) + (res_df['Vol_Score'] * 0.3)
+        res_df['SMA_Score'] = scale_score(res_df['SMA_Ratio'])
+        res_df['Vol_Score'] = scale_score(res_df['Vol_Ratio'])
+        
+        # 1. 종합 점수 계산 (SMA 70%, 거래량 30%)
+        res_df['Total_Score'] = (res_df['SMA_Score'] * 0.7) + (res_df['Vol_Score'] * 0.3)
+        res_df['Total_Score'] = res_df['Total_Score'].round(2)
+        
+        # 2. 추천 종목 10개로 확대 및 정렬
+        final_df = res_df.sort_values(by='Total_Score', ascending=False).head(10)
+        
+        # 출력 컬럼 정리 (요청대로 맨 오른쪽에 종합점수 표시)
+        final_display = final_df[['Ticker', 'Price', 'SMA_20', 'Volume', 'Total_Score']]
+        return final_display.reset_index(drop=True)
     
-    # 10개 종목 선별 및 정렬
-    final_df = res_df.sort_values(by='Total_Score', ascending=False).head(10)
-    
-    # 출력 컬럼 정리
-    final_display = final_df[['Ticker', 'Price', 'SMA_20', 'Volume', 'Total_Score']].copy()
-    final_display['Total_Score'] = final_display['Total_Score'].round(2)
-    
-    return final_display.reset_index(drop=True)
+    else:
+        print("조건에 맞는 데이터가 없습니다.")
+        return pd.DataFrame()
 
-# 테스트 실행 (미국 주식 예시)
-# 만약 한국 주식을 하신다면 "005930.KS" 처럼 뒤에 .KS나 .KQ를 붙여야 합니다.
-target_tickers = ["AAPL", "TSLA", "NVDA", "MSFT", "AMD", "GOOGL", "AMZN", "META", "NFLX", "INTC"]
-recommendations = get_recommendations(target_tickers)
-
-if not recommendations.empty:
-    print("\n[최종 추천 종목 상위 10개]")
-    print(recommendations)
+# 사용 예시
+# tickers = ["AAPL", "TSLA", "NVDA", "MSFT", "AMD", "GOOGL", "AMZN", "META", "NFLX", "INTC"]
+# print(get_recommendations(tickers))
