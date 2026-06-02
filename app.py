@@ -21,10 +21,11 @@ st.markdown("""
 
 st.title("📈 섹터 주도주 분석 및 거래량 기반 눌림목 추천")
 
-# --- 1. 날짜 설정 ---
+# --- 1. 날짜 설정 (오류 수정) ---
 today = datetime.now()
-last_year_start = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
-last_year_end = datetime(today.year - 1, 12, 31).strftime('%Y-%m-%d')
+# YTD 계산을 위해 작년 12월 20일부터 올해 1월 1일까지 범위를 잡아 데이터를 가져옵니다.
+last_year_start_range = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
+last_year_end_range = datetime(today.year, 1, 2).strftime('%Y-%m-%d') 
 today_str = today.strftime('%Y-%m-%d')
 
 # --- 2. 데이터 소스 가져오기 ---
@@ -82,8 +83,8 @@ if not sp500_data.empty:
     run_analysis = st.sidebar.button(f"{selected_menu} 분석 시작")
 
     if run_analysis:
-        performance_results = [] # 전체 성과 순위용
-        recommendation_results = [] # 눌림목 필터용
+        performance_results = []
+        recommendation_results = []
         
         hist_start = (datetime.now() - timedelta(weeks=160)).strftime('%Y-%m-%d')
         session = requests.Session()
@@ -98,8 +99,9 @@ if not sp500_data.empty:
                 chunk = target_tickers[i:i + chunk_size]
                 status_text.text(f"처리 중: {i}/{len(target_tickers)} 종목 완료")
                 try:
-                    ytd_base_df = yf.download(chunk, start=last_year_end if 'last_year_end' in locals() else last_year_start, 
-                                             end=last_year_end, interval="1d", group_by='ticker', session=session, threads=False, progress=False)
+                    # YTD 기준가를 잡기 위해 작년 말 데이터를 범위로 가져옴 (오류 방지를 위해 start/end 다르게 설정)
+                    ytd_base_df = yf.download(chunk, start=last_year_start_range, 
+                                             end=last_year_end_range, interval="1d", group_by='ticker', session=session, threads=False, progress=False)
                     w_data = yf.download(chunk, start=hist_start, end=today_str, 
                                         interval="1wk", group_by='ticker', session=session, threads=False, progress=False)
                     
@@ -111,12 +113,13 @@ if not sp500_data.empty:
                             w_df = w_data[ticker].dropna()
                             if t_base.empty or len(w_df) < 100: continue
 
+                            # 작년 말 마지막 거래일의 종가
                             base_price = t_base['Close'].iloc[-1]
                             curr_p = w_df['Close'].iloc[-1]
                             curr_v = w_df['Volume'].iloc[-1]
                             ytd_ret = ((curr_p / base_price) - 1) * 100
 
-                            # 1. 성과 순위 데이터 저장
+                            # 1. 성과 데이터 저장
                             performance_results.append({
                                 'Ticker': ticker, '현재가': curr_p, 'YTD': ytd_ret
                             })
@@ -128,28 +131,22 @@ if not sp500_data.empty:
                             max_v_8w = w_df['Volume'].iloc[-8:-1].max()
                             vol_ratio = (curr_v / max_v_8w) if max_v_8w > 0 else 1.0
 
-                            # 눌림목 필터 적용 (정배열 & 거래량 급감)
+                            # 눌림목 필터 적용
                             if (ma50 > ma100) and (vol_ratio <= 0.65):
                                 dist_ma20 = abs(curr_p - ma20) / ma20 * 100
                                 dist_ma50 = abs(curr_p - ma50) / ma50 * 100
                                 min_dist = min(dist_ma20, dist_ma50)
-                                
-                                # --- 종합 점수 계산 로직 ---
-                                # 1. 인접도 점수 (50점 만점): 이평선에 가까울수록(0%에 가까울수록) 높은 점수
-                                score_dist = max(0, 50 - (min_dist * 5))
-                                # 2. 거래량 점수 (50점 만점): 거래량이 더 많이 줄어들수록 높은 점수
-                                score_vol = max(0, 50 - (vol_ratio * 50))
-                                total_score = score_dist + score_vol
 
+                                # --- 종합 점수 계산 (인접도 가중치 + 거래량 감소 가중치) ---
+                                score = ( (1 - min_dist/10) * 60 ) + ( (1 - vol_ratio) * 40 )
+                                
                                 recommendation_results.append({
-                                    'Ticker': ticker, 
-                                    '종합점수': total_score,
-                                    'YTD': ytd_ret, 
-                                    '현재가': curr_p,
+                                    'Ticker': ticker, 'YTD': ytd_ret, '현재가': curr_p,
                                     '1Y_고점대비': ((curr_p / w_df['Close'].tail(52).max()) - 1) * 100,
                                     '거래량비중(%)': vol_ratio * 100,
                                     '인접도': min_dist,
-                                    '인접SMA': 'SMA 20' if dist_ma20 < dist_ma50 else 'SMA 50'
+                                    '인접SMA': 'SMA 20' if dist_ma20 < dist_ma50 else 'SMA 50',
+                                    '종합점수': max(0, round(score, 1))
                                 })
                         except: continue
                 except: pass
@@ -162,22 +159,22 @@ if not sp500_data.empty:
 
         # --- 결과 출력 ---
         if performance_results:
-            # 1. 섹터 전체 성과 상위 (YTD 기준)
             st.subheader(f"🏆 {selected_menu} 성과 상위 TOP 3 (YTD)")
             perf_df = pd.DataFrame(performance_results)
             top_3 = perf_df.sort_values('YTD', ascending=False).head(3)
             st.dataframe(top_3.style.format(precision=1), hide_index=True, width="stretch")
 
-            # 2. 눌림목 추천 종목 (10개로 확대)
             st.divider()
-            st.subheader(f"🔍 {selected_menu} 기술적 눌림목 추천 TOP 10 (종합점수 순)")
+            st.subheader(f"🔍 {selected_menu} 기술적 눌림목 추천 TOP 10")
             if recommendation_results:
                 recs_df = pd.DataFrame(recommendation_results)
-                # 종합점수 내림차순 정렬 후 상위 10개 추출
+                # 종합점수 기준 내림차순 정렬 후 상위 10개 표시
                 recs = recs_df.sort_values('종합점수', ascending=False).head(10)
-                st.dataframe(recs[['Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '거래량비중(%)', '인접SMA']].style.format(precision=1), 
+                # 종합점수를 가장 마지막 컬럼으로 배치
+                display_cols = ['Ticker', '현재가', 'YTD', '1Y_고점대비', '거래량비중(%)', '인접SMA', '종합점수']
+                st.dataframe(recs[display_cols].style.format(precision=1), 
                              hide_index=True, width="stretch")
             else:
-                st.info("현재 눌림목 조건(정배열 & 거래량 급감)을 만족하는 종목이 없습니다.")
+                st.info("현재 눌림목 조건을 만족하는 종목이 없습니다.")
         else:
-            st.error("데이터를 불러오는 데 실패했습니다.")
+            st.error("데이터를 불러오는 데 실패했습니다. 날짜 설정이나 네트워크 상태를 확인해주세요.")
