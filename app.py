@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
 import io
 import time
 import random
@@ -19,37 +20,81 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("📈 섹터 주도주 분석 및 거래량 기반 눌림목 추천")
+st.title("📈 섹터 주도주 분석 및 Finviz 기반 눌림목 추천")
 
-# 2. 유틸리티 함수: 포맷팅 및 단위 변환
-def format_val(val, is_currency=False):
-    if val is None or pd.isna(val) or val == "" or val == "nan" or val == 0:
+# 2. 유틸리티 함수: Finviz 데이터 포맷팅 및 파싱
+def format_to_one_decimal(val):
+    """Finviz의 문자열 데이터를 소수점 한자리로 포맷팅"""
+    if not val or val == '-':
         return "-"
+    suffix = ""
+    num_str = val.replace(',', '')
+    
+    if num_str.endswith('%'):
+        suffix = '%'
+        num_str = num_str[:-1]
+    elif num_str[-1].upper() in ['T', 'B', 'M', 'K'] and len(num_str) > 1:
+        suffix = num_str[-1].upper()
+        num_str = num_str[:-1]
+    
     try:
-        num = float(val)
-        if is_currency:
-            abs_num = abs(num)
-            if abs_num >= 1e9:
-                return f"{num/1e9:.1f}B"
-            elif abs_num >= 1e6:
-                return f"{num/1e6:.1f}M"
-            else:
-                return f"{num:.1f}"
-        return f"{num:.1f}"
-    except (ValueError, TypeError):
-        return str(val)
+        return f"{float(num_str):.1f}{suffix}"
+    except ValueError:
+        return val
 
-# 3. 날짜 설정
+# 3. Finviz 스크래핑 함수 (핵심: yfinance의 None 문제 해결)
+def get_finviz_fundamentals(ticker):
+    url = f"https://finviz.com/quote.ashx?t={ticker.upper()}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return None
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        table = soup.find('table', class_='snapshot-table2')
+        if not table:
+            return None
+        
+        cells = table.find_all('td')
+        temp_dict = {}
+        for i in range(0, len(cells), 2):
+            label = cells[i].text.strip()
+            value = cells[i+1].text.strip()
+            temp_dict[label] = value
+            
+        # 요청하신 지표 매핑
+        metrics = {
+            "Market Cap": format_to_one_decimal(temp_dict.get("Market Cap", "-")),
+            "Sales": format_to_one_decimal(temp_dict.get("Sales", "-")),
+            "Income": format_to_one_decimal(temp_dict.get("Income", "-")),
+            "P/E": format_to_one_decimal(temp_dict.get("P/E", "-")),
+            "Forward P/E": format_to_one_decimal(temp_dict.get("Forward P/E", "-")),
+            "PEG": format_to_one_decimal(temp_dict.get("PEG", "-")),
+            "P/S": format_to_one_decimal(temp_dict.get("P/S", "-")),
+            "EPS next 5Y": format_to_one_decimal(temp_dict.get("EPS next 5Y", "-")),
+            "Oper. Margin": format_to_one_decimal(temp_dict.get("Oper. Margin", "-")),
+            "EPS Q/Q": format_to_one_decimal(temp_dict.get("EPS Q/Q", "-")),
+            "Sales Q/Q": format_to_one_decimal(temp_dict.get("Sales Q/Q", "-"))
+        }
+        return metrics
+    except Exception:
+        return None
+
+# 4. 날짜 설정
 today = datetime.now()
 last_year_start_range = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
 last_year_end_range = datetime(today.year, 1, 2).strftime('%Y-%m-%d')
 today_str = today.strftime('%Y-%m-%d')
 hist_start = (today - timedelta(weeks=160)).strftime('%Y-%m-%d')
 
-# 4. 데이터 소스 가져오기 (캐싱 적용)
+# 5. 티커 리스트 가져오기
 @st.cache_data(ttl=86400)
 def get_sp500_list():
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
     url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
     try:
         res = requests.get(url, headers=headers, timeout=10)
@@ -69,7 +114,7 @@ def get_nasdaq100_list():
         return df[ticker_col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
     except: return []
 
-# 5. 사이드바 구성
+# 6. 메인 로직
 sp500_data = get_sp500_list()
 if not sp500_data.empty:
     gics_sectors = sorted(sp500_data['GICS Sector'].unique().tolist())
@@ -86,17 +131,14 @@ if not sp500_data.empty:
 
     if run_analysis:
         performance_results = []
-        recommendation_results = []
-        
-        # 세션 설정: Yahoo Finance 차단 회피를 위한 브라우저 헤더 설정
+        candidates = []
         session = requests.Session()
-        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
 
-        with st.status(f"{selected_menu} 데이터 분석 중...", expanded=True) as status:
+        with st.status(f"{selected_menu} 기술적 분석 중...", expanded=True) as status:
             progress_bar = st.progress(0)
-            chunk_size = 15
+            chunk_size = 20
 
-            # --- 기술적 분석 단계 (yf.download는 대량 요청에 비교적 안전함) ---
             for i in range(0, len(target_tickers), chunk_size):
                 chunk = target_tickers[i:i + chunk_size]
                 try:
@@ -109,6 +151,7 @@ if not sp500_data.empty:
                             w_df = w_data_all[ticker].dropna()
                             if len(w_df) < 100: continue
                             
+                            # YTD 수익률 계산
                             if ticker in ytd_base_all.columns.levels[0]:
                                 t_base = ytd_base_all[ticker].dropna()
                                 base_p = t_base['Close'].iloc[-1] if not t_base.empty else w_df['Close'].iloc[0]
@@ -118,6 +161,7 @@ if not sp500_data.empty:
                             ytd_ret = ((curr_p / base_p) - 1) * 100
                             performance_results.append({'Ticker': ticker, '현재가': curr_p, 'YTD': ytd_ret})
 
+                            # 눌림목 필터: 정배열 & 거래량 감소
                             ma20 = w_df['Close'].rolling(20).mean().iloc[-1]
                             ma50 = w_df['Close'].rolling(50).mean().iloc[-1]
                             ma100 = w_df['Close'].rolling(100).mean().iloc[-1]
@@ -130,7 +174,7 @@ if not sp500_data.empty:
                                 min_dist = min(dist_ma20, dist_ma50)
                                 score = ((1 - min_dist/10) * 60) + ((1 - vol_ratio) * 40)
 
-                                recommendation_results.append({
+                                candidates.append({
                                     'Ticker': ticker, 'YTD': ytd_ret, '현재가': curr_p,
                                     '1Y_고점대비': ((curr_p / w_df['Close'].tail(52).max()) - 1) * 100,
                                     '거래량비중(%)': vol_ratio * 100,
@@ -141,89 +185,52 @@ if not sp500_data.empty:
                 except: pass
                 progress_bar.progress(min((i + chunk_size) / len(target_tickers), 1.0))
 
-            # --- 재무 데이터 단계 (RateLimitError 방지를 위해 지연 시간 및 예외 처리 추가) ---
-            final_recs_list = []
-            if recommendation_results:
-                recs_df_raw = pd.DataFrame(recommendation_results).sort_values('종합점수', ascending=False).head(10)
-                for _, row in recs_df_raw.iterrows():
+            # --- 재무 데이터 스크래핑 (상위 10개만) ---
+            final_recs = []
+            if candidates:
+                status.update(label="Finviz 재무 데이터 수집 중...", state="running")
+                top_candidates = pd.DataFrame(candidates).sort_values('종합점수', ascending=False).head(10)
+                
+                for _, row in top_candidates.iterrows():
                     ticker = row['Ticker']
-                    try:
-                        # 요청 간 랜덤 지연 시간 추가 (0.5~1.5초)
-                        time.sleep(random.uniform(0.5, 1.5))
-                        
-                        t_obj = yf.Ticker(ticker, session=session)
-                        
-                        # info 가져오기 시도 (YFRateLimitError 주요 발생 지점)
-                        try:
-                            info = t_obj.info
-                        except:
-                            info = {} # Rate Limit 시 빈값으로 처리하여 다음 로직으로 진행
-                        
-                        # fast_info는 Rate Limit에 상대적으로 강함
-                        fast = t_obj.fast_info
-                        
-                        # 재무제표 시도 (Rate Limit 시 pass)
-                        try:
-                            income_stmt = t_obj.income_stmt
-                        except:
-                            income_stmt = pd.DataFrame()
-                        
-                        # Sales, Income 값 확보
-                        sales = income_stmt.loc['Total Revenue'].iloc[0] if not income_stmt.empty and 'Total Revenue' in income_stmt.index else info.get('totalRevenue')
-                        net_income = income_stmt.loc['Net Income'].iloc[0] if not income_stmt.empty and 'Net Income' in income_stmt.index else info.get('netIncomeToCommon')
+                    fundamentals = get_finviz_fundamentals(ticker)
+                    if fundamentals:
+                        row_data = row.to_dict()
+                        row_data.update(fundamentals)
+                        final_recs.append(row_data)
+                    time.sleep(0.2) # Finviz 차단 방지
 
-                        # 3년 평균 P/E 계산
-                        avg_pe_3y = None
-                        if not income_stmt.empty and 'Net Income' in income_stmt.index:
-                            avg_ni = income_stmt.loc['Net Income'].head(3).mean()
-                            m_cap = fast.get('market_cap', info.get('marketCap', 0))
-                            if avg_ni and avg_ni > 0:
-                                avg_pe_3y = m_cap / avg_ni
-
-                        row.update({
-                            'Market Cap': format_val(fast.get('market_cap', info.get('marketCap')), True),
-                            'Sales': format_val(sales, True),
-                            'Income': format_val(net_income, True),
-                            'P/E': format_val(info.get('trailingPE')),
-                            '3Y Avg P/E': format_val(avg_pe_3y),
-                            'Forward P/E': format_val(info.get('forwardPE')),
-                            'PEG': format_val(info.get('pegRatio')),
-                            'P/S': format_val(info.get('priceToSalesTrailing12Months')),
-                            'EPS next 5Y': format_val(info.get('earningsGrowth', 0) * 100),
-                            'Oper.Margin': format_val(info.get('operatingMargins', 0) * 100),
-                            'EPS Q/Q': format_val(info.get('earningsQuarterlyGrowth', 0) * 100),
-                            'Sales Q/Q': format_val(info.get('revenueQuarterlyGrowth', 0) * 100),
-                            '종합점수': format_val(row['종합점수']),
-                            'YTD': format_val(row['YTD']),
-                            '1Y_고점대비': format_val(row['1Y_고점대비']),
-                            '인접도': format_val(row['인접도']),
-                            '거래량비중(%)': format_val(row['거래량비중(%)'])
-                        })
-                    except Exception as e:
-                        # 개별 종목 로딩 실패 시 로그만 남기고 다음 종목 진행
-                        st.warning(f"{ticker} 데이터 로드 실패 (차단 가능성)")
-                        continue
-                    
-                    final_recs_list.append(row)
-            
             status.update(label="분석 완료!", state="complete")
 
-        # --- 결과 출력 ---
+        # 7. 결과 출력
         if performance_results:
             st.subheader(f"🏆 {selected_menu} 성과 상위 TOP 3 (YTD)")
             perf_df = pd.DataFrame(performance_results).sort_values('YTD', ascending=False).head(3)
             st.dataframe(perf_df.style.format({'현재가': '{:.1f}', 'YTD': '{:.1f}%'}), hide_index=True, use_container_width=True)
 
             st.divider()
-            st.subheader("🎯 기술적 눌림목 추천 TOP 10 (종합 점수순)")
-            if final_recs_list:
-                recs_df = pd.DataFrame(final_recs_list)
+            st.subheader("🎯 기술적 눌림목 추천 TOP 10 (Finviz 재무 지표 포함)")
+            if final_recs:
+                recs_df = pd.DataFrame(final_recs)
+                # 요청하신 순서대로 컬럼 재정렬
                 display_cols = [
                     'Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)',
-                    'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG', 'P/S', 
-                    'EPS next 5Y', 'Oper.Margin', 'EPS Q/Q', 'Sales Q/Q'
+                    'Market Cap', 'Sales', 'Income', 'P/E', 'Forward P/E', 'PEG', 'P/S', 
+                    'EPS next 5Y', 'Oper. Margin', 'EPS Q/Q', 'Sales Q/Q'
                 ]
-                final_display = recs_df.reindex(columns=display_cols)
-                st.dataframe(final_display, hide_index=True, use_container_width=True)
+                # 컬럼이 존재할 때만 출력
+                existing_cols = [c for c in display_cols if c in recs_df.columns]
+                
+                # 수치 데이터 포맷팅 및 오른쪽 정렬
+                st.dataframe(
+                    recs_df[existing_cols].style.format({
+                        '종합점수': '{:.1f}', '현재가': '{:.1f}', 'YTD': '{:.1f}%', 
+                        '1Y_고점대비': '{:.1f}%', '인접도': '{:.1f}', '거래량비중(%)': '{:.1f}%'
+                    }, na_rep='-'),
+                    hide_index=True, 
+                    use_container_width=True
+                )
             else:
                 st.info("조건을 만족하는 눌림목 종목이 없습니다.")
+        else:
+            st.error("데이터 수집에 실패했습니다.")
