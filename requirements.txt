@@ -2,4 +2,3 @@ streamlit
 yfinance
 pandas
 lxml
-pandas-datareader
