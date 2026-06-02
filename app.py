@@ -46,7 +46,7 @@ last_year_end_range = datetime(today.year, 1, 2).strftime('%Y-%m-%d')
 today_str = today.strftime('%Y-%m-%d')
 hist_start = (today - timedelta(weeks=160)).strftime('%Y-%m-%d')
 
-# 4. 데이터 소스 가져오기
+# 4. 데이터 소스 가져오기 (캐싱 적용)
 @st.cache_data(ttl=86400)
 def get_sp500_list():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
@@ -69,8 +69,8 @@ def get_nasdaq100_list():
         return df[ticker_col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
     except: return []
 
+# 5. 사이드바 구성
 sp500_data = get_sp500_list()
-
 if not sp500_data.empty:
     gics_sectors = sorted(sp500_data['GICS Sector'].unique().tolist())
     menu_options = gics_sectors + ["Nasdaq100"]
@@ -88,14 +88,15 @@ if not sp500_data.empty:
         performance_results = []
         recommendation_results = []
         
-        # Yahoo Finance 차단 방지를 위한 세션 설정
+        # 세션 설정: Yahoo Finance 차단 회피를 위한 브라우저 헤더 설정
         session = requests.Session()
-        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
+        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'})
 
-        with st.status(f"{selected_menu} 분석 중...", expanded=True) as status:
+        with st.status(f"{selected_menu} 데이터 분석 중...", expanded=True) as status:
             progress_bar = st.progress(0)
             chunk_size = 15
 
+            # --- 기술적 분석 단계 (yf.download는 대량 요청에 비교적 안전함) ---
             for i in range(0, len(target_tickers), chunk_size):
                 chunk = target_tickers[i:i + chunk_size]
                 try:
@@ -140,51 +141,69 @@ if not sp500_data.empty:
                 except: pass
                 progress_bar.progress(min((i + chunk_size) / len(target_tickers), 1.0))
 
-            # --- 상위 10개 종목 재무 데이터 정밀 수집 ---
+            # --- 재무 데이터 단계 (RateLimitError 방지를 위해 지연 시간 및 예외 처리 추가) ---
             final_recs_list = []
             if recommendation_results:
                 recs_df_raw = pd.DataFrame(recommendation_results).sort_values('종합점수', ascending=False).head(10)
                 for _, row in recs_df_raw.iterrows():
                     ticker = row['Ticker']
-                    t_obj = yf.Ticker(ticker, session=session)
-                    
-                    # 데이터 안정성 확보를 위해 여러 소스 시도
-                    info = t_obj.info if t_obj.info else {}
-                    fast = t_obj.fast_info
-                    income_stmt = t_obj.income_stmt
-                    
-                    # Sales, Income은 재무제표에서 직접 추출 (더 정확함)
-                    sales = income_stmt.loc['Total Revenue'].iloc[0] if not income_stmt.empty and 'Total Revenue' in income_stmt.index else info.get('totalRevenue')
-                    net_income = income_stmt.loc['Net Income'].iloc[0] if not income_stmt.empty and 'Net Income' in income_stmt.index else info.get('netIncomeToCommon')
-
-                    # 3년 평균 P/E 계산
                     try:
+                        # 요청 간 랜덤 지연 시간 추가 (0.5~1.5초)
+                        time.sleep(random.uniform(0.5, 1.5))
+                        
+                        t_obj = yf.Ticker(ticker, session=session)
+                        
+                        # info 가져오기 시도 (YFRateLimitError 주요 발생 지점)
+                        try:
+                            info = t_obj.info
+                        except:
+                            info = {} # Rate Limit 시 빈값으로 처리하여 다음 로직으로 진행
+                        
+                        # fast_info는 Rate Limit에 상대적으로 강함
+                        fast = t_obj.fast_info
+                        
+                        # 재무제표 시도 (Rate Limit 시 pass)
+                        try:
+                            income_stmt = t_obj.income_stmt
+                        except:
+                            income_stmt = pd.DataFrame()
+                        
+                        # Sales, Income 값 확보
+                        sales = income_stmt.loc['Total Revenue'].iloc[0] if not income_stmt.empty and 'Total Revenue' in income_stmt.index else info.get('totalRevenue')
+                        net_income = income_stmt.loc['Net Income'].iloc[0] if not income_stmt.empty and 'Net Income' in income_stmt.index else info.get('netIncomeToCommon')
+
+                        # 3년 평균 P/E 계산
+                        avg_pe_3y = None
                         if not income_stmt.empty and 'Net Income' in income_stmt.index:
                             avg_ni = income_stmt.loc['Net Income'].head(3).mean()
                             m_cap = fast.get('market_cap', info.get('marketCap', 0))
-                            avg_pe_3y = m_cap / avg_ni if avg_ni > 0 else None
-                        else: avg_pe_3y = None
-                    except: avg_pe_3y = None
+                            if avg_ni and avg_ni > 0:
+                                avg_pe_3y = m_cap / avg_ni
 
-                    row.update({
-                        'Market Cap': format_val(fast.get('market_cap', info.get('marketCap')), True),
-                        'Sales': format_val(sales, True),
-                        'Income': format_val(net_income, True),
-                        'P/E': format_val(info.get('trailingPE')),
-                        '3Y Avg P/E': format_val(avg_pe_3y),
-                        'Forward P/E': format_val(info.get('forwardPE')),
-                        'PEG': format_val(info.get('pegRatio')),
-                        'P/S': format_val(info.get('priceToSalesTrailing12Months')),
-                        'EPS next 5Y': format_val(info.get('earningsGrowth', 0) * 100),
-                        'Oper.Margin': format_val(info.get('operatingMargins', 0) * 100),
-                        'EPS Q/Q': format_val(info.get('earningsQuarterlyGrowth', 0) * 100),
-                        'Sales Q/Q': format_val(info.get('revenueQuarterlyGrowth', 0) * 100),
-                        '종합점수': format_val(row['종합점수']),
-                        'YTD': format_val(row['YTD']),
-                        '1Y_고점대비': format_val(row['1Y_고점대비']),
-                        '인접도': format_val(row['인접도']),
-                        '거래량비중(%)': format_val(row['거래량비중(%)'])
-                    })
+                        row.update({
+                            'Market Cap': format_val(fast.get('market_cap', info.get('marketCap')), True),
+                            'Sales': format_val(sales, True),
+                            'Income': format_val(net_income, True),
+                            'P/E': format_val(info.get('trailingPE')),
+                            '3Y Avg P/E': format_val(avg_pe_3y),
+                            'Forward P/E': format_val(info.get('forwardPE')),
+                            'PEG': format_val(info.get('pegRatio')),
+                            'P/S': format_val(info.get('priceToSalesTrailing12Months')),
+                            'EPS next 5Y': format_val(info.get('earningsGrowth', 0) * 100),
+                            'Oper.Margin': format_val(info.get('operatingMargins', 0) * 100),
+                            'EPS Q/Q': format_val(info.get('earningsQuarterlyGrowth', 0) * 100),
+                            'Sales Q/Q': format_val(info.get('revenueQuarterlyGrowth', 0) * 100),
+                            '종합점수': format_val(row['종합점수']),
+                            'YTD': format_val(row['YTD']),
+                            '1Y_고점대비': format_val(row['1Y_고점대비']),
+                            '인접도': format_val(row['인접도']),
+                            '거래량비중(%)': format_val(row['거래량비중(%)'])
+                        })
+                    except Exception as e:
+                        # 개별 종목 로딩 실패 시 로그만 남기고 다음 종목 진행
+                        st.warning(f"{ticker} 데이터 로드 실패 (차단 가능성)")
+                        continue
+                    
                     final_recs_list.append(row)
             
             status.update(label="분석 완료!", state="complete")
