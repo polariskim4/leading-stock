@@ -25,17 +25,14 @@ st.title("📈 섹터 주도주 분석 및 펀더멘털 기반 눌림목 추천"
 def format_to_one_decimal(val):
     if val is None or val == '-' or val == "" or str(val).lower() == 'nan':
         return "-"
-    
     suffix = ""
     text = str(val).replace(',', '').replace('$', '').strip()
-    
     if text.endswith('%'):
         suffix = '%'
         text = text[:-1]
     elif len(text) > 1 and text[-1].upper() in ['T', 'B', 'M', 'K']:
         suffix = text[-1].upper()
         text = text[:-1]
-    
     try:
         num = float(text)
         return f"{num:.1f}{suffix}"
@@ -54,7 +51,7 @@ def parse_market_cap(cap_str):
         return float(numeric_part) * multiplier
     except: return 0
 
-# 3. Finviz 스크래핑 (지표 추가)
+# 3. Finviz 스크래핑
 def get_finviz_fundamentals(ticker):
     url = f"https://finviz.com/quote.ashx?t={ticker.upper()}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -64,10 +61,8 @@ def get_finviz_fundamentals(ticker):
         soup = BeautifulSoup(response.text, 'html.parser')
         table = soup.find('table', class_='snapshot-table2')
         if not table: return None
-        
         cells = table.find_all('td')
         temp_dict = {cells[i].text.strip(): cells[i+1].text.strip() for i in range(0, len(cells), 2)}
-            
         return {
             "Market Cap": format_to_one_decimal(temp_dict.get("Market Cap", "-")),
             "Sales": format_to_one_decimal(temp_dict.get("Sales", "-")),
@@ -83,7 +78,56 @@ def get_finviz_fundamentals(ticker):
         }
     except: return None
 
-# 4. 데이터 로드
+# 4. 개별 종목 분석 함수 (실시간 검색용)
+def analyze_single_ticker(ticker, y_start, h_start, today_end):
+    try:
+        ytd_df = yf.download(ticker, start=y_start, end=today_end, interval="1d", progress=False)
+        w_df = yf.download(ticker, start=h_start, interval="1wk", progress=False).dropna()
+        if len(w_df) < 100: return None
+        
+        curr_p = w_df['Close'].iloc[-1]
+        base_p = ytd_df['Close'].iloc[-1] if not ytd_df.empty else w_df['Close'].iloc[0]
+        ytd_ret = ((curr_p / base_p) - 1) * 100
+        
+        ma20 = w_df['Close'].rolling(20).mean().iloc[-1]
+        ma50 = w_df['Close'].rolling(50).mean().iloc[-1]
+        ma100 = w_df['Close'].rolling(100).mean().iloc[-1]
+        max_v_8w = w_df['Volume'].iloc[-8:-1].max()
+        vol_ratio = (w_df['Volume'].iloc[-1] / max_v_8w) if max_v_8w > 0 else 1.0
+        
+        dist20, dist50 = abs(curr_p - ma20)/ma20 * 100, abs(curr_p - ma50)/ma50 * 100
+        min_dist = min(dist20, dist50)
+        score = max(0, (1 - min_dist/10)*60 + (1 - vol_ratio)*40)
+        
+        f_data = get_finviz_fundamentals(ticker)
+        if not f_data: return None
+        
+        avg_pe = "-"
+        try:
+            t_obj = yf.Ticker(ticker)
+            income = t_obj.income_stmt if not t_obj.income_stmt.empty else t_obj.financials
+            if not income.empty:
+                ni_row = income.loc[income.index.str.contains('Net Income', case=False, na=False)]
+                if not ni_row.empty:
+                    avg_ni = ni_row.iloc[0].head(3).mean()
+                    m_cap_val = parse_market_cap(f_data['Market Cap'])
+                    if avg_ni > 0: avg_pe = m_cap_val / avg_ni
+        except: pass
+        
+        res = {
+            'Ticker': ticker.upper(), '종합점수': float(format_to_one_decimal(score)),
+            '현재가': float(format_to_one_decimal(curr_p)), 'YTD': f"{format_to_one_decimal(ytd_ret)}%",
+            '1Y_고점대비': f"{format_to_one_decimal(((curr_p / w_df['Close'].tail(52).max()) - 1) * 100)}%",
+            '인접SMA': 'SMA 20' if dist20 < dist50 else 'SMA 50',
+            '인접도': float(format_to_one_decimal(min_dist)), 
+            '거래량비중(%)': f"{format_to_one_decimal(vol_ratio * 100)}%",
+            '3Y Avg P/E': format_to_one_decimal(avg_pe)
+        }
+        res.update(f_data)
+        return res
+    except: return None
+
+# 5. 데이터 소스 (위키피디아)
 @st.cache_data(ttl=86400)
 def get_ticker_source(market_type):
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -98,67 +142,53 @@ def get_ticker_source(market_type):
             return pd.read_html(io.StringIO(requests.get(url, headers=headers).text), match='Symbol')[0]
     except: return pd.DataFrame()
 
-# 5. 메인 UI 및 분석 로직
+# 6. 메인 로직
+today = datetime.now()
+y_start = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
+today_end = datetime(today.year, 1, 2).strftime('%Y-%m-%d')
+h_start = (today - timedelta(weeks=160)).strftime('%Y-%m-%d')
+
 sp500_raw = get_ticker_source("SP500")
 if not sp500_raw.empty:
     sectors = sorted(sp500_raw['GICS Sector'].unique().tolist())
     selected_menu = st.sidebar.selectbox("분석 대상 선택", sectors + ["Nasdaq100"])
     target_tickers = get_ticker_source("Nasdaq100") if selected_menu == "Nasdaq100" else sp500_raw[sp500_raw['GICS Sector'] == selected_menu]['Symbol'].tolist()
 
-    # 분석 결과 유지를 위해 세션 스테이트 사용
-    if 'analysis_results' not in st.session_state:
-        st.session_state.analysis_results = None
-    if 'perf_summary' not in st.session_state:
-        st.session_state.perf_summary = None
+    if 'analysis_results' not in st.session_state: st.session_state.analysis_results = None
+    if 'perf_summary' not in st.session_state: st.session_state.perf_summary = None
 
     if st.sidebar.button("분석 시작"):
         candidates, perf_results = [], []
-        today = datetime.now()
-        y_start = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
-        h_start = (today - timedelta(weeks=160)).strftime('%Y-%m-%d')
-
-        with st.status("실시간 데이터 분석 중...", expanded=True) as status:
-            progress_bar = st.progress(0)
+        with st.status("실시간 분석 중...", expanded=True) as status:
+            p_bar = st.progress(0)
             for i in range(0, len(target_tickers), 15):
                 chunk = target_tickers[i:i + 15]
                 try:
-                    ytd_all = yf.download(chunk, start=y_start, end=datetime(today.year, 1, 2).strftime('%Y-%m-%d'), interval="1d", group_by='ticker', progress=False)
+                    ytd_all = yf.download(chunk, start=y_start, end=today_end, interval="1d", group_by='ticker', progress=False)
                     w_all = yf.download(chunk, start=h_start, interval="1wk", group_by='ticker', progress=False)
-                    
                     for ticker in chunk:
                         try:
                             if ticker not in w_all.columns.levels[0]: continue
                             w_df = w_all[ticker].dropna()
                             if len(w_df) < 100: continue
-                            
                             curr_p = w_df['Close'].iloc[-1]
                             base_p = ytd_all[ticker]['Close'].iloc[-1] if ticker in ytd_all.columns.levels[0] and not ytd_all[ticker].empty else w_df['Close'].iloc[0]
                             ytd_ret = ((curr_p / base_p) - 1) * 100
                             perf_results.append({'Ticker': ticker, '현재가': curr_p, 'YTD': ytd_ret})
-
                             ma50, ma100 = w_df['Close'].rolling(50).mean().iloc[-1], w_df['Close'].rolling(100).mean().iloc[-1]
                             max_v_8w = w_df['Volume'].iloc[-8:-1].max()
                             vol_ratio = (w_df['Volume'].iloc[-1] / max_v_8w) if max_v_8w > 0 else 1.0
-
                             if ma50 > ma100 and vol_ratio <= 0.65:
                                 ma20 = w_df['Close'].rolling(20).mean().iloc[-1]
                                 dist20, dist50 = abs(curr_p - ma20)/ma20 * 100, abs(curr_p - ma50)/ma50 * 100
-                                min_dist = min(dist20, dist50)
-                                
-                                candidates.append({
-                                    'Ticker': ticker, '종합점수': max(0, (1 - min_dist/10)*60 + (1 - vol_ratio)*40),
-                                    '현재가': curr_p, 'YTD': ytd_ret,
-                                    '1Y_고점대비': ((curr_p / w_df['Close'].tail(52).max()) - 1) * 100,
-                                    '인접SMA': 'SMA 20' if dist20 < dist50 else 'SMA 50',
-                                    '인접도': min_dist, '거래량비중(%)': vol_ratio * 100
-                                })
+                                candidates.append({'Ticker': ticker, '종합점수': max(0, (1 - min(dist20, dist50)/10)*60 + (1 - vol_ratio)*40), '현재가': curr_p, 'YTD': ytd_ret, '1Y_고점대비': ((curr_p / w_df['Close'].tail(52).max()) - 1) * 100, '인접SMA': 'SMA 20' if dist20 < dist50 else 'SMA 50', '인접도': min(dist20, dist50), '거래량비중(%)': vol_ratio * 100})
                         except: continue
                 except: pass
-                progress_bar.progress(min((i + 15) / len(target_tickers), 1.0))
+                p_bar.progress(min((i + 15) / len(target_tickers), 1.0))
             
             final_recs = []
             if candidates:
-                status.update(label="Finviz 재무 지표 수집 및 3Y PE 분석 중...", state="running")
+                status.update(label="재무 지표 수집 중...", state="running")
                 top_10 = pd.DataFrame(candidates).sort_values('종합점수', ascending=False).head(10)
                 for _, row in top_10.iterrows():
                     f_data = get_finviz_fundamentals(row['Ticker'])
@@ -174,56 +204,41 @@ if not sp500_raw.empty:
                                     m_cap_val = parse_market_cap(f_data['Market Cap'])
                                     if avg_ni > 0: avg_pe = m_cap_val / avg_ni
                         except: pass
-                        
                         r_dict = row.to_dict()
                         r_dict.update(f_data)
                         r_dict['3Y Avg P/E'] = format_to_one_decimal(avg_pe)
-                        
                         for k in ['종합점수', '현재가', 'YTD', '1Y_고점대비', '인접도', '거래량비중(%)']:
                             if k in r_dict:
-                                formatted = format_to_one_decimal(r_dict[k])
-                                if k in ['YTD', '1Y_고점대비', '거래량비중(%)']: r_dict[k] = f"{formatted}%"
-                                else: r_dict[k] = formatted
+                                fmt = format_to_one_decimal(r_dict[k])
+                                r_dict[k] = f"{fmt}%" if k in ['YTD', '1Y_고점대비', '거래량비중(%)'] else float(fmt)
                         final_recs.append(r_dict)
                     time.sleep(0.2)
-            
-            st.session_state.analysis_results = final_recs
-            st.session_state.perf_summary = perf_results
+            st.session_state.analysis_results, st.session_state.perf_summary = final_recs, perf_results
             status.update(label="분석 완료!", state="complete")
 
-    # --- 결과 출력부 ---
+    # --- 결과 출력 ---
     if st.session_state.perf_summary:
-        st.subheader(f"🏆 {selected_menu} 성과 상위 TOP 3 (YTD)")
-        perf_df = pd.DataFrame(st.session_state.perf_summary).sort_values('YTD', ascending=False).head(3)
-        st.dataframe(perf_df.style.format({'현재가': '{:.1f}', 'YTD': '{:.1f}%'}), hide_index=True, use_container_width=True)
-
         st.divider()
         st.subheader("🎯 기술적 눌림목 추천 TOP 10 (종합 점수순)")
-        
         if st.session_state.analysis_results:
             df = pd.DataFrame(st.session_state.analysis_results)
+            search_ticker = st.text_input("분석 및 강조할 티커 입력 (예: TSLA):", "").upper()
             
-            # 티커 강조 검색창
-            search_ticker = st.text_input("강조 표시할 티커를 입력하세요 (예: AAPL):", "").upper()
+            # 검색 티커가 리스트에 없으면 실시간 추가 분석
+            if search_ticker and search_ticker not in df['Ticker'].values:
+                with st.spinner(f"{search_ticker} 데이터 분석 중..."):
+                    new_row = analyze_single_ticker(search_ticker, y_start, h_start, today_end)
+                    if new_row:
+                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                        df = df.sort_values('종합점수', ascending=False)
+                    else: st.error(f"{search_ticker} 데이터를 찾을 수 없습니다.")
 
-            cols = [
-                'Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)', 
-                'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG', 
-                'P/S', 'EPS next 5Y', 'Oper. Margin', 'EPS Q/Q', 'Sales Q/Q'
-            ]
+            cols = ['Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)', 'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG', 'P/S', 'EPS next 5Y', 'Oper. Margin', 'EPS Q/Q', 'Sales Q/Q']
             existing_cols = [c for c in cols if c in df.columns]
 
-            # 하이라이트 스타일 함수
             def highlight_row(row):
-                if row.Ticker == search_ticker:
-                    return ['background-color: #2E4053; color: yellow; font-weight: bold'] * len(row)
+                if row.Ticker == search_ticker: return ['background-color: #1B2631; color: #F1C40F; font-weight: bold'] * len(row)
                 return [''] * len(row)
 
-            st.dataframe(
-                df[existing_cols].style.apply(highlight_row, axis=1),
-                hide_index=True, 
-                use_container_width=True, 
-                column_config={c: st.column_config.Column(alignment="right") for c in existing_cols}
-            )
-        else:
-            st.info("조건을 만족하는 눌림목 종목이 없습니다.")
+            st.dataframe(df[existing_cols].style.apply(highlight_row, axis=1), hide_index=True, use_container_width=True, column_config={c: st.column_config.Column(alignment="right") for c in existing_cols})
+        else: st.info("조건을 만족하는 종목이 없습니다.")
