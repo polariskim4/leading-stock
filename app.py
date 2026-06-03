@@ -80,23 +80,28 @@ def get_finviz_fundamentals(ticker):
         }
     except: return None
 
-# 4. 개별 종목 분석 함수 (단일 종목 조회 시 발생하는 인덱스 구조 및 날짜 문제 해결)
+# 4. 개별 종목 분석 함수 (구조적 통일을 위해 group_by='ticker' 강제 적용)
 def analyze_single_ticker(ticker, y_start, h_start):
     try:
-        # 현재가 조회를 위해 종료 날짜를 오늘 이후로 넉넉히 설정
-        current_limit = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-        ytd_df = yf.download(ticker, start=y_start, end=current_limit, interval="1d", progress=False)
-        w_df = yf.download(ticker, start=h_start, end=current_limit, interval="1wk", progress=False).dropna()
+        ticker = ticker.upper()
+        # group_by='ticker'를 사용하여 단일 종목도 MultiIndex 구조로 가져옴
+        ytd_df_all = yf.download(ticker, start=y_start, interval="1d", group_by='ticker', progress=False)
+        w_df_all = yf.download(ticker, start=h_start, interval="1wk", group_by='ticker', progress=False)
+        
+        if ticker not in ytd_df_all.columns.levels[0] or ticker not in w_df_all.columns.levels[0]:
+            return None
+
+        ytd_df = ytd_df_all[ticker].dropna()
+        w_df = w_df_all[ticker].dropna()
         
         if ytd_df.empty or w_df.empty: return None
         
-        # 단일 종목 다운로드 시 df['Close']는 MultiIndex가 아닌 Series 형태임
-        curr_p = float(w_df['Close'].iloc[-1])
+        curr_p = w_df['Close'].iloc[-1]
         
-        # YTD 기준가 추출 (작년 말 근처)
+        # YTD 기준가 추출 (작년 말 데이터 범위 내에서 가장 마지막 값)
         y_cut = datetime.strptime(y_start, '%Y-%m-%d') + timedelta(days=20)
         ytd_slice = ytd_df[ytd_df.index <= y_cut.strftime('%Y-%m-%d')]
-        base_p = float(ytd_slice['Close'].iloc[-1]) if not ytd_slice.empty else float(ytd_df['Close'].iloc[0])
+        base_p = ytd_slice['Close'].iloc[-1] if not ytd_slice.empty else ytd_df['Close'].iloc[0]
         
         ytd_ret = ((curr_p / base_p) - 1) * 100
         
@@ -125,7 +130,7 @@ def analyze_single_ticker(ticker, y_start, h_start):
         except: pass
         
         res = {
-            'Ticker': ticker.upper(), 
+            'Ticker': ticker, 
             '종합점수': format_to_one_decimal(score),
             '현재가': format_to_one_decimal(curr_p), 
             'YTD': f"{format_to_one_decimal(ytd_ret)}%",
@@ -137,7 +142,8 @@ def analyze_single_ticker(ticker, y_start, h_start):
         }
         res.update(f_data)
         return res
-    except:
+    except Exception as e:
+        # 에러 로그 확인용 (필요시 st.error(e)로 확인 가능)
         return None
 
 # 5. 데이터 소스 로드
@@ -176,9 +182,8 @@ if not sp500_raw.empty:
             for i in range(0, len(target_tickers), 15):
                 chunk = target_tickers[i:i + 15]
                 try:
-                    current_end = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-                    ytd_all = yf.download(chunk, start=y_start, end=current_end, interval="1d", group_by='ticker', progress=False)
-                    w_all = yf.download(chunk, start=h_start, end=current_end, interval="1wk", group_by='ticker', progress=False)
+                    ytd_all = yf.download(chunk, start=y_start, interval="1d", group_by='ticker', progress=False)
+                    w_all = yf.download(chunk, start=h_start, interval="1wk", group_by='ticker', progress=False)
                     for ticker in chunk:
                         try:
                             if ticker not in w_all.columns.levels[0]: continue
@@ -265,7 +270,6 @@ if not sp500_raw.empty:
                 if row.Ticker == search_ticker: return ['background-color: #1B2631; color: #F1C40F; font-weight: bold'] * len(row)
                 return [''] * len(row)
 
-            # 컬럼 설정: Ticker 왼쪽, 나머지 오른쪽 정렬
             column_config = {"Ticker": st.column_config.Column(alignment="left")}
             for col in existing_cols:
                 if col != "Ticker": column_config[col] = st.column_config.Column(alignment="right")
