@@ -53,7 +53,7 @@ def parse_market_cap(cap_str):
         return float(numeric_part) * multiplier
     except: return 0
 
-# 3. Finviz 스크래핑
+# 3. Finviz 스크래핑 (ROIC 항목 추가)
 def get_finviz_fundamentals(ticker):
     url = f"https://finviz.com/quote.ashx?t={ticker.upper()}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -75,18 +75,19 @@ def get_finviz_fundamentals(ticker):
             "P/S": format_to_one_decimal(temp_dict.get("P/S", "-")),
             "EPS next 5Y": format_to_one_decimal(temp_dict.get("EPS next 5Y", "-")),
             "Oper. Margin": format_to_one_decimal(temp_dict.get("Oper. Margin", "-")),
+            "ROIC": format_to_one_decimal(temp_dict.get("ROIC", "-")), # ROIC 추가
             "EPS Q/Q": format_to_one_decimal(temp_dict.get("EPS Q/Q", "-")),
             "Sales Q/Q": format_to_one_decimal(temp_dict.get("Sales Q/Q", "-"))
         }
     except: return None
 
-# 4. 개별 종목 분석 함수 (구조적 통일을 위해 group_by='ticker' 강제 적용)
+# 4. 개별 종목 분석 함수
 def analyze_single_ticker(ticker, y_start, h_start):
     try:
         ticker = ticker.upper()
-        # group_by='ticker'를 사용하여 단일 종목도 MultiIndex 구조로 가져옴
-        ytd_df_all = yf.download(ticker, start=y_start, interval="1d", group_by='ticker', progress=False)
-        w_df_all = yf.download(ticker, start=h_start, interval="1wk", group_by='ticker', progress=False)
+        current_limit = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        ytd_df_all = yf.download(ticker, start=y_start, end=current_limit, interval="1d", group_by='ticker', progress=False)
+        w_df_all = yf.download(ticker, start=h_start, end=current_limit, interval="1wk", group_by='ticker', progress=False)
         
         if ticker not in ytd_df_all.columns.levels[0] or ticker not in w_df_all.columns.levels[0]:
             return None
@@ -96,12 +97,10 @@ def analyze_single_ticker(ticker, y_start, h_start):
         
         if ytd_df.empty or w_df.empty: return None
         
-        curr_p = w_df['Close'].iloc[-1]
-        
-        # YTD 기준가 추출 (작년 말 데이터 범위 내에서 가장 마지막 값)
+        curr_p = float(w_df['Close'].iloc[-1])
         y_cut = datetime.strptime(y_start, '%Y-%m-%d') + timedelta(days=20)
         ytd_slice = ytd_df[ytd_df.index <= y_cut.strftime('%Y-%m-%d')]
-        base_p = ytd_slice['Close'].iloc[-1] if not ytd_slice.empty else ytd_df['Close'].iloc[0]
+        base_p = float(ytd_slice['Close'].iloc[-1]) if not ytd_slice.empty else float(ytd_df['Close'].iloc[0])
         
         ytd_ret = ((curr_p / base_p) - 1) * 100
         
@@ -142,9 +141,7 @@ def analyze_single_ticker(ticker, y_start, h_start):
         }
         res.update(f_data)
         return res
-    except Exception as e:
-        # 에러 로그 확인용 (필요시 st.error(e)로 확인 가능)
-        return None
+    except: return None
 
 # 5. 데이터 소스 로드
 @st.cache_data(ttl=86400)
@@ -182,22 +179,20 @@ if not sp500_raw.empty:
             for i in range(0, len(target_tickers), 15):
                 chunk = target_tickers[i:i + 15]
                 try:
-                    ytd_all = yf.download(chunk, start=y_start, interval="1d", group_by='ticker', progress=False)
-                    w_all = yf.download(chunk, start=h_start, interval="1wk", group_by='ticker', progress=False)
+                    current_end = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+                    ytd_all = yf.download(chunk, start=y_start, end=current_end, interval="1d", group_by='ticker', progress=False)
+                    w_all = yf.download(chunk, start=h_start, end=current_end, interval="1wk", group_by='ticker', progress=False)
                     for ticker in chunk:
                         try:
                             if ticker not in w_all.columns.levels[0]: continue
                             w_df = w_all[ticker].dropna()
                             if len(w_df) < 100: continue
                             curr_p = w_df['Close'].iloc[-1]
-                            
                             y_cut = datetime.strptime(y_start, '%Y-%m-%d') + timedelta(days=20)
                             ytd_slice = ytd_all[ticker][ytd_all[ticker].index <= y_cut.strftime('%Y-%m-%d')]
                             base_p = ytd_slice['Close'].dropna().iloc[-1] if not ytd_slice.empty else w_df['Close'].iloc[0]
-                            
                             ytd_ret = ((curr_p / base_p) - 1) * 100
                             perf_results.append({'Ticker': ticker, '현재가': curr_p, 'YTD': ytd_ret})
-                            
                             ma50, ma100 = w_df['Close'].rolling(50).mean().iloc[-1], w_df['Close'].rolling(100).mean().iloc[-1]
                             max_v_8w = w_df['Volume'].iloc[-8:-1].max()
                             vol_ratio = (w_df['Volume'].iloc[-1] / max_v_8w) if max_v_8w > 0 else 1.0
@@ -252,18 +247,18 @@ if not sp500_raw.empty:
             df = pd.DataFrame(st.session_state.analysis_results)
             search_ticker = st.text_input("분석 및 강조할 티커 입력 (예: TSLA):", "").upper()
             
-            if search_ticker:
-                if search_ticker not in df['Ticker'].values:
-                    with st.spinner(f"{search_ticker} 실시간 분석 중..."):
-                        new_row = analyze_single_ticker(search_ticker, y_start, h_start)
-                        if new_row:
-                            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                            df['score_num'] = df['종합점수'].apply(lambda x: float(str(x).replace('%','')) if x != '-' else -1)
-                            df = df.sort_values('score_num', ascending=False).drop(columns=['score_num'])
-                        else:
-                            st.warning(f"{search_ticker} 데이터를 찾을 수 없습니다. 티커를 확인해 주세요.")
+            if search_ticker and search_ticker not in df['Ticker'].values:
+                with st.spinner(f"{search_ticker} 실시간 분석 중..."):
+                    new_row = analyze_single_ticker(search_ticker, y_start, h_start)
+                    if new_row:
+                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                        df['score_num'] = df['종합점수'].apply(lambda x: float(str(x).replace('%','')) if x != '-' else -1)
+                        df = df.sort_values('score_num', ascending=False).drop(columns=['score_num'])
+                    else:
+                        st.warning(f"{search_ticker} 데이터를 찾을 수 없습니다. 티커를 확인해 주세요.")
 
-            cols = ['Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)', 'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG', 'P/S', 'EPS next 5Y', 'Oper. Margin', 'EPS Q/Q', 'Sales Q/Q']
+            # 컬럼 순서 및 구성 (ROIC 추가됨)
+            cols = ['Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)', 'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG', 'P/S', 'EPS next 5Y', 'Oper. Margin', 'ROIC', 'EPS Q/Q', 'Sales Q/Q']
             existing_cols = [c for c in cols if c in df.columns]
 
             def highlight_row(row):
