@@ -21,13 +21,12 @@ st.markdown("""
 
 st.title("📈 섹터 주도주 분석 및 펀더멘털 기반 눌림목 추천")
 
-# 2. 유틸리티 함수: 모든 수치를 소수점 한 자리로 고정
+# 2. 유틸리티 함수
 def format_to_one_decimal(val):
     if val is None or val == '-' or val == "" or str(val).lower() == 'nan':
         return "-"
     
     suffix = ""
-    # 문자열로 변환 후 전처리
     text = str(val).replace(',', '').replace('$', '').strip()
     
     if text.endswith('%'):
@@ -44,20 +43,18 @@ def format_to_one_decimal(val):
         return val
 
 def parse_market_cap(cap_str):
-    """문자열 시총을 숫자로 변환 (3y PE 계산용)"""
     if not cap_str or cap_str == '-': return 0
     multiplier = 1
     clean_str = str(cap_str).replace(',', '').replace('$', '').strip()
     if 'T' in clean_str: multiplier = 1e12
     elif 'B' in clean_str: multiplier = 1e9
     elif 'M' in clean_str: multiplier = 1e6
-    
     try:
         numeric_part = ''.join(c for c in clean_str if c.isdigit() or c == '.')
         return float(numeric_part) * multiplier
     except: return 0
 
-# 3. Finviz 스크래핑 (기본 정보 유지)
+# 3. Finviz 스크래핑 (지표 추가)
 def get_finviz_fundamentals(ticker):
     url = f"https://finviz.com/quote.ashx?t={ticker.upper()}"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -101,12 +98,18 @@ def get_ticker_source(market_type):
             return pd.read_html(io.StringIO(requests.get(url, headers=headers).text), match='Symbol')[0]
     except: return pd.DataFrame()
 
-# 5. 메인 UI
+# 5. 메인 UI 및 분석 로직
 sp500_raw = get_ticker_source("SP500")
 if not sp500_raw.empty:
     sectors = sorted(sp500_raw['GICS Sector'].unique().tolist())
     selected_menu = st.sidebar.selectbox("분석 대상 선택", sectors + ["Nasdaq100"])
     target_tickers = get_ticker_source("Nasdaq100") if selected_menu == "Nasdaq100" else sp500_raw[sp500_raw['GICS Sector'] == selected_menu]['Symbol'].tolist()
+
+    # 분석 결과 유지를 위해 세션 스테이트 사용
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+    if 'perf_summary' not in st.session_state:
+        st.session_state.perf_summary = None
 
     if st.sidebar.button("분석 시작"):
         candidates, perf_results = [], []
@@ -114,7 +117,7 @@ if not sp500_raw.empty:
         y_start = datetime(today.year - 1, 12, 20).strftime('%Y-%m-%d')
         h_start = (today - timedelta(weeks=160)).strftime('%Y-%m-%d')
 
-        with st.status("데이터 분석 중...", expanded=True) as status:
+        with st.status("실시간 데이터 분석 중...", expanded=True) as status:
             progress_bar = st.progress(0)
             for i in range(0, len(target_tickers), 15):
                 chunk = target_tickers[i:i + 15]
@@ -133,7 +136,6 @@ if not sp500_raw.empty:
                             ytd_ret = ((curr_p / base_p) - 1) * 100
                             perf_results.append({'Ticker': ticker, '현재가': curr_p, 'YTD': ytd_ret})
 
-                            # 기술적 지표
                             ma50, ma100 = w_df['Close'].rolling(50).mean().iloc[-1], w_df['Close'].rolling(100).mean().iloc[-1]
                             max_v_8w = w_df['Volume'].iloc[-8:-1].max()
                             vol_ratio = (w_df['Volume'].iloc[-1] / max_v_8w) if max_v_8w > 0 else 1.0
@@ -154,10 +156,9 @@ if not sp500_raw.empty:
                 except: pass
                 progress_bar.progress(min((i + 15) / len(target_tickers), 1.0))
             
-            # 상위 10개 펀더멘털 정밀 분석
             final_recs = []
             if candidates:
-                status.update(label="Finviz 및 3Y Avg PE 계산 중...", state="running")
+                status.update(label="Finviz 재무 지표 수집 및 3Y PE 분석 중...", state="running")
                 top_10 = pd.DataFrame(candidates).sort_values('종합점수', ascending=False).head(10)
                 for _, row in top_10.iterrows():
                     f_data = get_finviz_fundamentals(row['Ticker'])
@@ -165,7 +166,6 @@ if not sp500_raw.empty:
                         avg_pe = "-"
                         try:
                             t_obj = yf.Ticker(row['Ticker'])
-                            # income_stmt가 없으면 financials 시도
                             income = t_obj.income_stmt if not t_obj.income_stmt.empty else t_obj.financials
                             if not income.empty:
                                 ni_row = income.loc[income.index.str.contains('Net Income', case=False, na=False)]
@@ -179,28 +179,51 @@ if not sp500_raw.empty:
                         r_dict.update(f_data)
                         r_dict['3Y Avg P/E'] = format_to_one_decimal(avg_pe)
                         
-                        # 모든 수치 소수점 한자리 포맷팅
                         for k in ['종합점수', '현재가', 'YTD', '1Y_고점대비', '인접도', '거래량비중(%)']:
                             if k in r_dict:
                                 formatted = format_to_one_decimal(r_dict[k])
-                                if k in ['YTD', '1Y_고점대비', '거래량비중(%)']:
-                                    r_dict[k] = f"{formatted}%"
-                                else:
-                                    r_dict[k] = formatted
+                                if k in ['YTD', '1Y_고점대비', '거래량비중(%)']: r_dict[k] = f"{formatted}%"
+                                else: r_dict[k] = formatted
                         final_recs.append(r_dict)
                     time.sleep(0.2)
+            
+            st.session_state.analysis_results = final_recs
+            st.session_state.perf_summary = perf_results
             status.update(label="분석 완료!", state="complete")
 
-        # 결과 출력
-        if perf_results:
-            st.subheader(f"🏆 {selected_menu} 성과 상위 TOP 3 (YTD)")
-            perf_df = pd.DataFrame(perf_results).sort_values('YTD', ascending=False).head(3)
-            st.dataframe(perf_df.style.format({'현재가': '{:.1f}', 'YTD': '{:.1f}%'}), hide_index=True, use_container_width=True)
+    # --- 결과 출력부 ---
+    if st.session_state.perf_summary:
+        st.subheader(f"🏆 {selected_menu} 성과 상위 TOP 3 (YTD)")
+        perf_df = pd.DataFrame(st.session_state.perf_summary).sort_values('YTD', ascending=False).head(3)
+        st.dataframe(perf_df.style.format({'현재가': '{:.1f}', 'YTD': '{:.1f}%'}), hide_index=True, use_container_width=True)
 
-            st.divider()
-            st.subheader("🎯 기술적 눌림목 추천 TOP 10 (종합 점수순)")
-            if final_recs:
-                df = pd.DataFrame(final_recs)
-                cols = ['Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)', 'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG']
-                existing_cols = [c for c in cols if c in df.columns]
-                st.dataframe(df[existing_cols], hide_index=True, use_container_width=True, column_config={c: st.column_config.Column(alignment="right") for c in existing_cols})
+        st.divider()
+        st.subheader("🎯 기술적 눌림목 추천 TOP 10 (종합 점수순)")
+        
+        if st.session_state.analysis_results:
+            df = pd.DataFrame(st.session_state.analysis_results)
+            
+            # 티커 강조 검색창
+            search_ticker = st.text_input("강조 표시할 티커를 입력하세요 (예: AAPL):", "").upper()
+
+            cols = [
+                'Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)', 
+                'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG', 
+                'P/S', 'EPS next 5Y', 'Oper. Margin', 'EPS Q/Q', 'Sales Q/Q'
+            ]
+            existing_cols = [c for c in cols if c in df.columns]
+
+            # 하이라이트 스타일 함수
+            def highlight_row(row):
+                if row.Ticker == search_ticker:
+                    return ['background-color: #2E4053; color: yellow; font-weight: bold'] * len(row)
+                return [''] * len(row)
+
+            st.dataframe(
+                df[existing_cols].style.apply(highlight_row, axis=1),
+                hide_index=True, 
+                use_container_width=True, 
+                column_config={c: st.column_config.Column(alignment="right") for c in existing_cols}
+            )
+        else:
+            st.info("조건을 만족하는 눌림목 종목이 없습니다.")
