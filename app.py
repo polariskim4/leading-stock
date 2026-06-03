@@ -80,23 +80,23 @@ def get_finviz_fundamentals(ticker):
         }
     except: return None
 
-# 4. 개별 종목 분석 함수 (TSLA 등 단일 종목 검색 오류 해결)
+# 4. 개별 종목 분석 함수 (단일 종목 조회 시 발생하는 인덱스 구조 및 날짜 문제 해결)
 def analyze_single_ticker(ticker, y_start, h_start):
     try:
-        # 단일 종목의 경우 end 날짜를 지정하지 않거나 오늘로 지정하여 최신 데이터를 가져옵니다.
-        today_val = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-        
-        ytd_df = yf.download(ticker, start=y_start, end=today_val, interval="1d", progress=False)
-        w_df = yf.download(ticker, start=h_start, end=today_val, interval="1wk", progress=False).dropna()
+        # 현재가 조회를 위해 종료 날짜를 오늘 이후로 넉넉히 설정
+        current_limit = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        ytd_df = yf.download(ticker, start=y_start, end=current_limit, interval="1d", progress=False)
+        w_df = yf.download(ticker, start=h_start, end=current_limit, interval="1wk", progress=False).dropna()
         
         if ytd_df.empty or w_df.empty: return None
         
-        curr_p = w_df['Close'].iloc[-1]
+        # 단일 종목 다운로드 시 df['Close']는 MultiIndex가 아닌 Series 형태임
+        curr_p = float(w_df['Close'].iloc[-1])
         
-        # YTD 기준일 (작년 말 근처 데이터 중 가장 마지막)
+        # YTD 기준가 추출 (작년 말 근처)
         y_cut = datetime.strptime(y_start, '%Y-%m-%d') + timedelta(days=20)
         ytd_slice = ytd_df[ytd_df.index <= y_cut.strftime('%Y-%m-%d')]
-        base_p = ytd_slice['Close'].iloc[-1] if not ytd_slice.empty else ytd_df['Close'].iloc[0]
+        base_p = float(ytd_slice['Close'].iloc[-1]) if not ytd_slice.empty else float(ytd_df['Close'].iloc[0])
         
         ytd_ret = ((curr_p / base_p) - 1) * 100
         
@@ -137,7 +137,7 @@ def analyze_single_ticker(ticker, y_start, h_start):
         }
         res.update(f_data)
         return res
-    except Exception as e:
+    except:
         return None
 
 # 5. 데이터 소스 로드
@@ -176,8 +176,9 @@ if not sp500_raw.empty:
             for i in range(0, len(target_tickers), 15):
                 chunk = target_tickers[i:i + 15]
                 try:
-                    ytd_all = yf.download(chunk, start=y_start, interval="1d", group_by='ticker', progress=False)
-                    w_all = yf.download(chunk, start=h_start, interval="1wk", group_by='ticker', progress=False)
+                    current_end = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+                    ytd_all = yf.download(chunk, start=y_start, end=current_end, interval="1d", group_by='ticker', progress=False)
+                    w_all = yf.download(chunk, start=h_start, end=current_end, interval="1wk", group_by='ticker', progress=False)
                     for ticker in chunk:
                         try:
                             if ticker not in w_all.columns.levels[0]: continue
@@ -205,7 +206,7 @@ if not sp500_raw.empty:
             
             final_recs = []
             if candidates:
-                status.update(label="재무 지표 수집 중...", state="running")
+                status.update(label="재무 데이터 수집 중...", state="running")
                 top_10 = pd.DataFrame(candidates).sort_values('종합점수', ascending=False).head(10)
                 for _, row in top_10.iterrows():
                     f_data = get_finviz_fundamentals(row['Ticker'])
@@ -246,15 +247,16 @@ if not sp500_raw.empty:
             df = pd.DataFrame(st.session_state.analysis_results)
             search_ticker = st.text_input("분석 및 강조할 티커 입력 (예: TSLA):", "").upper()
             
-            if search_ticker and search_ticker not in df['Ticker'].values:
-                with st.spinner(f"{search_ticker} 실시간 분석 중..."):
-                    new_row = analyze_single_ticker(search_ticker, y_start, h_start)
-                    if new_row:
-                        df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                        df['score_num'] = df['종합점수'].apply(lambda x: float(str(x).replace('%','')) if x != '-' else -1)
-                        df = df.sort_values('score_num', ascending=False).drop(columns=['score_num'])
-                    else:
-                        st.warning(f"{search_ticker} 데이터를 찾을 수 없습니다. 티커를 확인해 주세요.")
+            if search_ticker:
+                if search_ticker not in df['Ticker'].values:
+                    with st.spinner(f"{search_ticker} 실시간 분석 중..."):
+                        new_row = analyze_single_ticker(search_ticker, y_start, h_start)
+                        if new_row:
+                            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+                            df['score_num'] = df['종합점수'].apply(lambda x: float(str(x).replace('%','')) if x != '-' else -1)
+                            df = df.sort_values('score_num', ascending=False).drop(columns=['score_num'])
+                        else:
+                            st.warning(f"{search_ticker} 데이터를 찾을 수 없습니다. 티커를 확인해 주세요.")
 
             cols = ['Ticker', '종합점수', '현재가', 'YTD', '1Y_고점대비', '인접SMA', '인접도', '거래량비중(%)', 'Market Cap', 'Sales', 'Income', 'P/E', '3Y Avg P/E', 'Forward P/E', 'PEG', 'P/S', 'EPS next 5Y', 'Oper. Margin', 'EPS Q/Q', 'Sales Q/Q']
             existing_cols = [c for c in cols if c in df.columns]
@@ -263,9 +265,10 @@ if not sp500_raw.empty:
                 if row.Ticker == search_ticker: return ['background-color: #1B2631; color: #F1C40F; font-weight: bold'] * len(row)
                 return [''] * len(row)
 
+            # 컬럼 설정: Ticker 왼쪽, 나머지 오른쪽 정렬
             column_config = {"Ticker": st.column_config.Column(alignment="left")}
             for col in existing_cols:
                 if col != "Ticker": column_config[col] = st.column_config.Column(alignment="right")
 
             st.dataframe(df[existing_cols].style.apply(highlight_row, axis=1), hide_index=True, width="stretch", column_config=column_config)
-        else: st.info("조건을 만족하는 종목이 없습니다.")
+        else: st.info("조건을 만족하는 눌림목 종목이 없습니다.")
